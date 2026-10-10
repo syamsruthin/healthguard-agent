@@ -31,7 +31,7 @@ from pydantic import BaseModel, ValidationError
 from backend.core.config import settings
 from backend.core.errors import UpstreamError
 from backend.core.logging import get_logger
-from backend.core.telemetry import LLM_ERRORS
+from backend.core.telemetry import LLM_ERRORS, end_llm_span, start_span
 from backend.llm import cache as llm_cache
 from backend.llm.prompts import PROMPT_VERSION
 from backend.llm.registry import ModelSpec, Role, spec_for, supports_cache_control
@@ -202,6 +202,9 @@ class OpenRouterClient:
         if extra:
             kwargs["extra_body"] = extra
         t0 = time.monotonic()
+        llm_span = start_span(
+            "llm.complete", llm_role=role.value, llm_call=name, llm_requested_model=spec.model
+        )
         try:
             try:
                 resp = await self._client.chat.completions.create(**kwargs)
@@ -222,6 +225,7 @@ class OpenRouterClient:
                 )
             )
             log.warning("llm_call_failed", role=role.value, call=name, model=spec.model, error=str(exc)[:300])
+            end_llm_span(llm_span, model=spec.model, usage={}, error=str(exc))
             raise LLMError(f"LLM call '{name}' failed: {exc.__class__.__name__}") from exc
 
         latency = int((time.monotonic() - t0) * 1000)
@@ -229,6 +233,7 @@ class OpenRouterClient:
         served = getattr(resp, "model", None) or spec.model
         usage = parse_usage(getattr(resp, "usage", None))
         record(LLMCallRecord(role=role.value, name=name, model=served, latency_ms=latency, **usage))
+        end_llm_span(llm_span, model=served, usage=usage)
         if key and text:
             await llm_cache.put(key, {"text": text, "model": served})
         return LLMResult(text=text, model=served, usage=usage)
@@ -312,6 +317,9 @@ class OpenRouterClient:
         t0 = time.monotonic()
         served = spec.model
         usage: dict[str, Any] = {}
+        llm_span = start_span(
+            "llm.stream", llm_role=role.value, llm_call=name, llm_requested_model=spec.model
+        )
         try:
             resp = await self._client.chat.completions.create(**kwargs)
             async for chunk in resp:
@@ -333,7 +341,9 @@ class OpenRouterClient:
                     latency_ms=int((time.monotonic() - t0) * 1000),
                 )
             )
+            end_llm_span(llm_span, model=spec.model, usage={}, error=str(exc))
             raise LLMError(f"LLM stream '{name}' failed: {exc.__class__.__name__}") from exc
+        end_llm_span(llm_span, model=served, usage=usage)
         record(
             LLMCallRecord(
                 role=role.value,

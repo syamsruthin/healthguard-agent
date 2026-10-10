@@ -83,3 +83,23 @@ def span(name: str, **attributes: Any) -> Iterator[Any]:
                     key, value if isinstance(value, (str, int, float, bool)) else str(value)
                 )
         yield current
+
+
+def start_span(name: str, **attributes: Any) -> Any:
+    """A span that is NOT made current — safe to hold across `yield` in async generators. Call `.end()`."""
+    s = _tracer.start_span(name)
+    for key, value in attributes.items():
+        if value is not None:
+            s.set_attribute(key, value if isinstance(value, (str, int, float, bool)) else str(value))
+    return s
+
+
+def end_llm_span(s: Any, *, model: str, usage: dict[str, Any], error: str | None = None) -> None:
+    s.set_attribute("llm.model", model)
+    for key in ("prompt_tokens", "completion_tokens", "cached_tokens", "cache_write_tokens", "cost_usd"):
+        if key in usage:
+            s.set_attribute(f"llm.{key}", usage[key])
+    if error:
+        s.set_attribute("error", True)
+        s.set_attribute("error.message", error[:300])
+    s.end()
