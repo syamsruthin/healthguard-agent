@@ -62,7 +62,7 @@ _INJECTION_PATTERNS = [
     r"\bact\s+as\s+(an?\s+)?(admin|administrator|database|sql)\b",
 ]
 _INJECTION = re.compile("|".join(_INJECTION_PATTERNS), re.IGNORECASE)
-_MEMBER_ID = re.compile(r"\bM\d{6}\b")
+_MEMBER_ID = re.compile(r"\bM\d{6}\b", re.IGNORECASE)
 
 
 def prefilter(message: str, user: UserContext) -> str | None:
@@ -71,7 +71,7 @@ def prefilter(message: str, user: UserContext) -> str | None:
         return "prompt_injection"
     if not user.is_admin:
         allowed = {user.member_id, *(d["member_id"] for d in user.dependents)} - {None}
-        mentioned = set(_MEMBER_ID.findall(message))
+        mentioned = {m.upper() for m in _MEMBER_ID.findall(message)}
         if mentioned - allowed:
             return "other_member_data"
     return None

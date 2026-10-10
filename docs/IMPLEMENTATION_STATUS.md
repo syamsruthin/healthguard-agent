@@ -1,6 +1,6 @@
 # HealthGuard Production Upgrade — Implementation Status
 
-**Last updated:** 2026-10-10  
+**Last updated:** 2026-10-10 (session 2: local continuation)  
 **Branch:** `claude/vigilant-wozniak-f6rbb3`  
 **Scope:** turn the HealthGuard demo (Groq + SQLite + ChromaDB + Streamlit) into a production-grade agentic RAG application on OpenRouter.
 
@@ -9,6 +9,22 @@
 > Today the **data pipeline works end to end** (migrate → seed → ingest), and the tools work on their own. **The API and UI do not run right now**: `backend/main.py` is still the old file and imports modules that were removed, and the old Streamlit app was deleted before its replacement was written. See [Known gaps and broken items](#6-known-gaps-and-broken-items-right-now).
 
 ---
+
+## 0. Session 2 progress (local continuation)
+
+Work resumed locally (macOS, Docker Desktop, live `OPENROUTER_API_KEY`). The continuation plan runs the
+remaining phases in this order: **P0 baseline → 7 → L0 live smoke → 9 → 8 → 10 → L1 → 12 → 14 → 11 → L2 → 13**.
+
+| Step | Status | Notes |
+|---|---|---|
+| P0 Baseline | ✅ Done | `uv sync` on the locked toolchain; migrate + seed + ingest verified locally; `hg-models-check` passes against the live catalog (all 4 chat slugs exist); `backend/main.py` replaced by a minimal app factory (`/health/live`); ruff, format and mypy clean; `tests/` scaffold with 72 unit + 11 integration tests (SQL guard, sandbox, chunking, RRF, prompt-cache markers, usage, exact cache, JWT, guardrails, sources, registry, FakeLLM, RLS matrix, sandbox run, hybrid search) |
+
+Fixes made in P0:
+- `prefilter` member-ID check is case-insensitive (`m100004` was slipping through).
+- `registry.spec_for` coerces plain strings to `Role` (a string role silently fell through to the judge model).
+- `FakeLLM` can script exceptions (for failure-path tests).
+- **Sandbox cold start no longer counts against the user-code timeout.** Spawning a worker (pandas import + CSV load) takes ~6 s, so the first provider query after a restart could hit the 10 s limit. New `sandbox.warm_up()` starts the pool with its own 120 s startup limit.
+- `docker-compose.yml`: Postgres host port is configurable (`POSTGRES_HOST_PORT`, default 5432) for machines that already run a native Postgres.
 
 ## 1. Decisions confirmed with the user
 
@@ -313,17 +329,17 @@ Written, linted and importable, but **not yet wired into a graph or tested**:
 
 | Item | Impact | Fix (phase) |
 |---|---|---|
-| `backend/main.py` is the **old** file and imports `backend.agents.orchestrator`, which was removed | API does not start | Phase 9 |
+| ~~`backend/main.py` is the **old** file~~ — replaced by a minimal app factory serving `/health/live` (P0) | Full API still missing | Phase 9 |
 | Old `frontend/app.py` **deleted**; new UI not written | No UI | Phase 12 |
 | `docker-compose.yml` `api` / `worker` / `ui` services point to code that doesn't exist yet | Only the `postgres` and `redis` services are verified; `migrate` depends on the unbuilt image | Phases 9, 10, 12 |
 | `deploy/Dockerfile` never built | Image build unverified | Phase 13 |
 | `pyproject.toml` scripts `hg-eval`, `hg-build-golden` point to missing modules | Those commands fail | Phase 11 |
-| `.github/workflows/ci.yml` would fail: `tests/` is empty (pytest exit 5), ruff and format checks flag old `main.py`, mypy never run | CI red | Phases 9, 14 |
+| `.github/workflows/ci.yml`: lint, format, mypy and both test stages now pass locally (P0); Docker build still unverified | CI expected green except Docker job | Phase 13 |
 | `README.md`, `DEMO_QUESTIONS.md`, `specs/*.md` still describe the old Groq / SQLite / Chroma system | Misleading docs | Phase 13 |
 | **Nothing has run against live OpenRouter** (`openrouter.ai` blocked in the build sandbox) | Model slugs, prompt behaviour, prompt-cache hits and answer quality unverified; no RAGAS scores exist | Needs network access + API key |
 | Retrieval tested only with the lexical `hash` embedder | Real retrieval quality unmeasured | Re-run `hg-ingest --force` with OpenRouter embeddings |
 | tiktoken couldn't download its encoding in the sandbox; character-based estimate used | Chunk sizes approximate (Docker image pre-fetches the encoding) | — |
-| Tool verification was ad-hoc scripts, not pytest | No regression protection yet | Phase 14 |
+| ~~Tool verification was ad-hoc scripts~~ — ported to pytest (P0) | — | — |
 | Minor data/doc mismatches: the $35 insulin cap is stated but not enforced by the claims engine (no insulin claims are generated); the cardiac-rehab doc says the first 36 sessions don't count toward the therapy limit while the engine counts them (no persona hits the limit) | Cosmetic | Phase 3 follow-up |
 | RLS design choice: a subscriber sees dependents' records; a **spouse** who is not the subscriber sees only their own | Intended, but should be documented in the privacy doc | Phase 13 |
 

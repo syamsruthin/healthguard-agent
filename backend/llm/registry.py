@@ -27,12 +27,13 @@ class ModelSpec:
     max_tokens: int = 1024
 
 
-def spec_for(role: Role, model: str | None = None) -> ModelSpec:
-    if role is Role.FAST:
+def spec_for(role: Role | str, model: str | None = None) -> ModelSpec:
+    role = Role(role)  # a plain string must not silently fall through to the judge spec
+    if role == Role.FAST:
         return ModelSpec(role, model or settings.model_fast, settings.model_fast_fallbacks, 0.0, 1200)
-    if role is Role.CODE:
+    if role == Role.CODE:
         return ModelSpec(role, model or settings.model_code, settings.model_code_fallbacks, 0.0, 1200)
-    if role is Role.SYNTH:
+    if role == Role.SYNTH:
         return ModelSpec(role, model or settings.model_synth, settings.model_synth_fallbacks, 0.2, 1600)
     return ModelSpec(role, model or settings.eval_judges[0], [], 0.0, 2048)
 

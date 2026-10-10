@@ -25,7 +25,8 @@ services:
       POSTGRES_USER: healthguard
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-healthguard}
       POSTGRES_DB: healthguard
-    ports: ["5432:5432"]
+    # Host port is configurable for machines that already run a native Postgres on 5432.
+    ports: ["${POSTGRES_HOST_PORT:-5432}:5432"]
     volumes: [pg-data:/var/lib/postgresql/data]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U healthguard -d healthguard"]

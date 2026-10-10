@@ -313,6 +313,11 @@ def _execute(code: str, max_rows: int) -> dict[str, Any]:  # pragma: no cover - 
 # Parent-side pool management
 # ═══════════════════════════════════════════════════════════════════════════
 _pool: ProcessPoolExecutor | None = None
+_warm = False  # every worker has finished its initializer (CSV load)
+_warm_lock: asyncio.Lock | None = None
+# Spawning a worker imports pandas and loads the lake (several seconds on a
+# cold machine). That cost must never count against the user code's timeout.
+_STARTUP_TIMEOUT_SECONDS = 120.0
 
 
 def _get_pool() -> ProcessPoolExecutor:
@@ -328,7 +333,8 @@ def _get_pool() -> ProcessPoolExecutor:
 
 
 def _reset_pool() -> None:
-    global _pool
+    global _pool, _warm
+    _warm = False
     if _pool is not None:
         for proc in list(getattr(_pool, "_processes", {}).values()):
             proc.kill()
@@ -336,8 +342,33 @@ def _reset_pool() -> None:
         _pool = None
 
 
+async def warm_up() -> None:
+    """Start every pool worker and wait for its initializer, outside any user-code timeout."""
+    global _warm, _warm_lock
+    if _warm:
+        return
+    if _warm_lock is None:
+        _warm_lock = asyncio.Lock()
+    async with _warm_lock:
+        if _warm:
+            return
+        loop = asyncio.get_running_loop()
+        pool = _get_pool()
+        # One trivial job per worker: the executor spawns a worker for each job it cannot hand to an idle one.
+        jobs = [
+            loop.run_in_executor(pool, _execute, "result = 0", 1) for _ in range(settings.sandbox_workers)
+        ]
+        try:
+            await asyncio.wait_for(asyncio.gather(*jobs), timeout=_STARTUP_TIMEOUT_SECONDS)
+        except (TimeoutError, BrokenProcessPool) as exc:
+            _reset_pool()
+            raise SandboxError("sandbox workers failed to start") from exc
+        _warm = True
+
+
 async def run_code(code: str) -> dict[str, Any]:
     validate_code(code)  # fail fast in the parent
+    await warm_up()
     loop = asyncio.get_running_loop()
     try:
         future = loop.run_in_executor(_get_pool(), _execute, code, settings.sandbox_max_rows)

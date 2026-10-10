@@ -106,7 +106,9 @@ async def _load(conn: asyncpg.Connection, table: str, rows: list[dict[str, Any]]
 async def _upsert_users(conn: asyncpg.Connection) -> list[tuple[str, str]]:
     pw_hash = hash_password(settings.demo_password)
     created = []
-    accounts = [(p.email, f"{p.first_name} {p.last_name}", "member", p.member_id) for p in PERSONAS]
+    accounts: list[tuple[str, str, str, str | None]] = [
+        (p.email, f"{p.first_name} {p.last_name}", "member", p.member_id) for p in PERSONAS
+    ]
     accounts.append((settings.admin_email, "HealthGuard Admin", "admin", None))
     for email, name, role, member_id in accounts:
         await conn.execute(

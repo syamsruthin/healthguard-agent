@@ -41,8 +41,8 @@ def build_personas(gen: PopulationGenerator) -> None:
         ledger = FamilyLedger(plan=plan, family=len(members) > 1)
         events = [(e.service_date, 0, e) for e in enc] + [(x.fill_date, 1, x) for x in fills]
         events.sort(key=lambda t: (t[0], t[1]))
-        for _d, kind, ev in events:
-            if kind == 0:
+        for _d, _kind, ev in events:
+            if isinstance(ev, Encounter):
                 gen.claims.append(f.adjudicate(ledger, ev, sub))
             else:
                 gen.rx_claims.append(f.adjudicate_rx(ledger, ev, sub))
@@ -109,7 +109,7 @@ def _persona_members(gen: PopulationGenerator, p: Persona, plan: dict[str, Any])
 # ═══════════════════════════════════════════════════════════════════════════
 # Scripts
 # ═══════════════════════════════════════════════════════════════════════════
-def _maria(d, drugs, f, sub, enc, fills, pas):  # type: ignore[no-untyped-def]
+def _maria(d, drugs, f, sub, enc, fills, pas):
     pcp, ortho, pt = _prov(d, "1700000001"), _prov(d, "1700000002"), _prov(d, "1700000003")
     imaging = _fac(d, "Austin Imaging Center")
     enc += [
@@ -209,7 +209,7 @@ def _maria(d, drugs, f, sub, enc, fills, pas):  # type: ignore[no-untyped-def]
         when += timedelta(days=30)
 
 
-def _james(d, drugs, f, sub, enc, fills, pas):  # type: ignore[no-untyped-def]
+def _james(d, drugs, f, sub, enc, fills, pas):
     pcp, endo, derm = _prov(d, "1700000005"), _prov(d, "1700000004"), _prov(d, "1700000006")
     enc.append(Encounter(sub, D(2026, 2, 3), "99396", "Z00.00", pcp, allowed=198.0))
     for mo in (1, 4, 7):
@@ -270,7 +270,7 @@ def _james(d, drugs, f, sub, enc, fills, pas):  # type: ignore[no-untyped-def]
         when += timedelta(days=28)
 
 
-def _priya(d, drugs, f, sub, enc, fills, pas):  # type: ignore[no-untyped-def]
+def _priya(d, drugs, f, sub, enc, fills, pas):
     obgyn, pcp = _prov(d, "1700000007"), _prov(d, "1700000016")
     enc.append(Encounter(sub, D(2026, 1, 28), "99395", "Z00.00", pcp, allowed=185.0))
     for k, when in enumerate(
@@ -335,7 +335,7 @@ def _priya(d, drugs, f, sub, enc, fills, pas):  # type: ignore[no-untyped-def]
         when += timedelta(days=30)
 
 
-def _robert(d, drugs, f, sub, enc, fills, pas):  # type: ignore[no-untyped-def]
+def _robert(d, drugs, f, sub, enc, fills, pas):
     cardio, pcp = _prov(d, "1700000008"), _prov(d, "1700000014")
     er = _fac(d, "Bayfront Regional Medical Center")
     enc += [
@@ -432,7 +432,7 @@ def _robert(d, drugs, f, sub, enc, fills, pas):  # type: ignore[no-untyped-def]
             when += timedelta(days=30)
 
 
-def _aisha(d, drugs, f, sub, enc, fills, pas):  # type: ignore[no-untyped-def]
+def _aisha(d, drugs, f, sub, enc, fills, pas):
     pcp, psych, psychiatrist = _prov(d, "1700000015"), _prov(d, "1700000009"), _prov(d, "1700000010")
     enc.append(Encounter(sub, D(2026, 1, 21), "99213", "F41.1", pcp, allowed=110.0))
     enc.append(
@@ -467,7 +467,7 @@ def _aisha(d, drugs, f, sub, enc, fills, pas):  # type: ignore[no-untyped-def]
         when += timedelta(days=30)
 
 
-def _david(d, drugs, f, sub, enc, fills, pas):  # type: ignore[no-untyped-def]
+def _david(d, drugs, f, sub, enc, fills, pas):
     pcp, ped, allergy = _prov(d, "1700000012"), _prov(d, "1700000011"), _prov(d, "1700000013")
     urgent_in, urgent_oon = _fac(d, "Front Range Urgent Care"), _fac(d, "Mile High Walk-In Clinic")
     imaging = _fac(d, "Denver Diagnostic Imaging")

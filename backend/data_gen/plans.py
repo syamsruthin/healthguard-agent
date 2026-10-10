@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import random
-from typing import Any
+from typing import Any, cast
 
 from backend.data_gen.reference import (
     HDHP_BASE,
@@ -34,7 +34,7 @@ def generate_plans(rng: random.Random) -> list[dict[str, Any]]:
                 vcode, prem_f, ded_f, copay_f = VARIANTS[variant]
                 plan_id = f"{net.code}-{METAL_CODES[metal]}-{vcode}"
                 if net.code == "HDHP":
-                    base = HDHP_BASE[metal]
+                    base = cast(dict[str, Any], HDHP_BASE[metal])
                     deductible = _r(base["deductible"] * ded_f, 50)
                     deductible = max(deductible, 1700.0)  # IRS 2026 HDHP minimum
                     oop = min(_r(base["oop"] * (0.97 if variant == "Plus" else 1.0), 50), 8500.0)
@@ -58,7 +58,8 @@ def generate_plans(rng: random.Random) -> list[dict[str, Any]]:
                     )
                     rx4 = rx5 = coins
                 else:
-                    base = METAL_BASE[metal]
+                    # values are only None for copays (deductible + coinsurance applies)
+                    base = cast(dict[str, Any], METAL_BASE[metal])
                     deductible = _r(float(base["deductible"]) * (ded_f if metal != "Catastrophic" else 1), 50)
                     oop = min(_r(float(base["oop"]) * (0.95 if variant == "Plus" else 1.0), 50), 10150.0)
                     deductible = min(deductible, oop)

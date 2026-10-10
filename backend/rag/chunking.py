@@ -30,7 +30,9 @@ class Chunk:
 
 def _blocks(text: str) -> list[str]:
     """Split into paragraphs, keeping markdown tables as single blocks."""
-    blocks, buf, in_table = [], [], False
+    blocks: list[str] = []
+    buf: list[str] = []
+    in_table = False
     for line in text.splitlines():
         is_table = line.strip().startswith("|")
         if not line.strip():

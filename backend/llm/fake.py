@@ -4,7 +4,9 @@ Deterministic, scripted LLM for tests (no network).
 Responses are looked up by the call `name` (e.g. "understand", "sql",
 "providers", "synthesize", "verify"). A response can be a string, a
 Pydantic model / dict (for structured calls), a list (consumed in order
-across repeated calls) or a callable `(messages) -> value`.
+across repeated calls; the last element repeats), a callable
+`(messages) -> value`, or an exception instance, which is raised (use it to
+simulate provider failures such as `LLMError`).
 """
 
 from __future__ import annotations
@@ -34,6 +36,8 @@ class FakeLLM:
             value = value.pop(0) if len(value) > 1 else value[0]
         if callable(value) and not isinstance(value, type):
             value = value(messages)
+        if isinstance(value, BaseException):
+            raise value
         return value
 
     @staticmethod
@@ -45,6 +49,7 @@ class FakeLLM:
         return str(value)
 
     def _record(self, role: Role, name: str, messages: list[dict[str, Any]]) -> None:
+        role = Role(role)
         self.calls.append({"role": role.value, "name": name, "messages": messages})
         record(
             LLMCallRecord(
