@@ -21,12 +21,13 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    func,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from backend.core.config import settings
-from backend.db.base import APP_SCHEMA, Base, created_at_col, uuid_pk
+from backend.db.base import APP_SCHEMA, Base, created_at_col, utcnow, uuid_pk
 
 _S = {"schema": APP_SCHEMA}
 
@@ -76,7 +77,9 @@ class Conversation(Base):
     summary_upto: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     is_eval: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = created_at_col()
-    updated_at: Mapped[datetime] = created_at_col()
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), default=utcnow, onupdate=utcnow
+    )
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     messages: Mapped[list[Message]] = relationship(
@@ -97,7 +100,7 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text)
     standalone_query: Mapped[str | None] = mapped_column(Text, nullable=True)
     trace_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
-    tools: Mapped[list[str]] = mapped_column(JSONB, default=list)
+    tools: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)  # per-step summaries
     citations: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, default=list)
     meta: Mapped[dict[str, Any]] = mapped_column("metadata", JSONB, default=dict)
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)

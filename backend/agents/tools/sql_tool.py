@@ -35,8 +35,8 @@ def format_rows(rows: list[dict[str, Any]], total: int, truncated: bool) -> str:
     return table + note
 
 
-async def execute_scoped(sql: str, user: UserContext) -> tuple[list[dict[str, Any]], bool]:
-    """Run validated SQL as the read-only agent role with RLS context for this user."""
+async def execute_scoped(sql: str, user: UserContext, *params: Any) -> tuple[list[dict[str, Any]], bool]:
+    """Run validated (or fixed, parameterised) SQL as the read-only agent role with this user's RLS context."""
     role = "admin" if user.is_admin else "member"
     member_id = user.member_id if (user.member_id and MEMBER_ID_RE.match(user.member_id)) else ""
     pool = await get_agent_pool()
@@ -45,7 +45,7 @@ async def execute_scoped(sql: str, user: UserContext) -> tuple[list[dict[str, An
         await conn.execute(f"SET LOCAL app.role = '{role}'")
         await conn.execute(f"SET LOCAL app.member_id = '{member_id}'")
         await conn.execute(f"SET LOCAL statement_timeout = {int(settings.sql_statement_timeout_ms)}")
-        records = await conn.fetch(sql)
+        records = await conn.fetch(sql, *params)
     rows = [jsonable(dict(r)) for r in records]
     truncated = len(rows) >= settings.sql_max_rows
     return rows, truncated

@@ -20,6 +20,7 @@ remaining phases in this order: **P0 baseline → 7 → L0 live smoke → 9 → 
 | P0 Baseline | ✅ Done | `uv sync` on the locked toolchain; migrate + seed + ingest verified locally; `hg-models-check` passes against the live catalog (all 4 chat slugs exist); `backend/main.py` replaced by a minimal app factory (`/health/live`); ruff, format and mypy clean; `tests/` scaffold with 72 unit + 11 integration tests (SQL guard, sandbox, chunking, RRF, prompt-cache markers, usage, exact cache, JWT, guardrails, sources, registry, FakeLLM, RLS matrix, sandbox run, hybrid search) |
 | P7 Agent graph | ✅ Done | `backend/agents/{planning,graph,runner}.py`, `nodes/{understand,cache_lookup,execute,synthesize,verify}.py`, `backend/cache/semantic.py`, `hg-chat` CLI; 32 graph/planning/cache unit tests + Postgres checkpointer and Redis 8 vector-cache integration tests |
 | L0 Live smoke test | ✅ Done | First run against live OpenRouter; corpus re-embedded with `openai/text-embedding-3-small`; 8/8 persona scenarios answered, grounded and complete (see below) |
+| P9 Auth + API | ✅ Done | App factory + lifespan; pure-ASGI request-id / security-header / body-size middleware; JWT auth with refresh rotation + reuse detection; conversations CRUD (soft delete + checkpoint cleanup); JSON and SSE chat; feedback; coverage card; admin metrics / traces / eval runs; Redis rate limits; arq enqueue seam. 17 API integration tests; live SSE turn verified through `uvicorn` |
 
 Fixes made in P0:
 - `prefilter` member-ID check is case-insensitive (`m100004` was slipping through).
@@ -101,7 +102,7 @@ The slugs come from a web search (Oct 2026), not a live API check, because `open
 | 6 | Hardened tools: SQL guard + RLS execution, pandas sandbox, policy search | ✅ Done and verified | `a718a96` |
 | 7 | Agent graph rewrite (LangGraph) | ✅ Done (session 2) | see §0 |
 | 8 | Memory: history window, rolling summary, long-term memories | ⬜ Not started | — |
-| 9 | Auth + API + semantic cache | ⬜ Not started (design settled) | — |
+| 9 | Auth + API + semantic cache | ✅ Done (session 2) | see §0 |
 | 10 | Background worker (arq) | ⬜ Not started | — |
 | 11 | Evaluations (RAGAS jury, online eval, golden set) | ⬜ Not started (APIs checked) | — |
 | 12 | Streamlit multipage UI | ⬜ Not started (old UI removed) | — |
@@ -362,7 +363,7 @@ Written, linted and importable, but **not yet wired into a graph or tested**:
 
 | Item | Impact | Fix (phase) |
 |---|---|---|
-| ~~`backend/main.py` is the **old** file~~ — replaced by a minimal app factory serving `/health/live` (P0) | Full API still missing | Phase 9 |
+| ~~`backend/main.py` is the **old** file~~ — full API app factory (P9) | — | — |
 | Old `frontend/app.py` **deleted**; new UI not written | No UI | Phase 12 |
 | `docker-compose.yml` `api` / `worker` / `ui` services point to code that doesn't exist yet | Only the `postgres` and `redis` services are verified; `migrate` depends on the unbuilt image | Phases 9, 10, 12 |
 | `deploy/Dockerfile` never built | Image build unverified | Phase 13 |

@@ -65,7 +65,7 @@ def configure_logging() -> None:
         cache_logger_on_first_use=True,
     )
     logging.basicConfig(level=level, stream=sys.stderr, format="%(levelname)s %(name)s: %(message)s")
-    for noisy in ("httpx", "httpcore", "openai", "urllib3"):
+    for noisy in ("httpx", "httpx2", "httpcore", "httpcore2", "openai", "urllib3"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 

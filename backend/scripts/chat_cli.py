@@ -26,6 +26,7 @@ from backend.agents.runner import run_graph
 from backend.agents.state import initial_state
 from backend.agents.tools import sandbox
 from backend.cache.semantic import maybe_store
+from backend.core.logging import configure_logging
 from backend.core.redis import close_redis
 from backend.db.session import SessionLocal, dispose, get_data_version
 from backend.llm.usage import start_collection, stop_collection
@@ -114,6 +115,7 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 async def _main(args: argparse.Namespace) -> int:
+    configure_logging()
     try:
         return await _run(args)
     finally:
