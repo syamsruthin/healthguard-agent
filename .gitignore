@@ -1,53 +1,40 @@
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
 *.so
 *.egg-info/
 dist/
 build/
-*.egg
-
-# Virtual environments
 .venv/
-venv/
-ENV/
-
-# UV
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
 .python-version
 
-# IDE
+# IDE / OS
 .vscode/
 .idea/
 *.swp
-*.swo
-*~
+.DS_Store
+Thumbs.db
 
 # Environment
 .env
 .env.local
 
-# Data (generated - can be regenerated via setup_data.py)
-backend/data/insurance.db
-backend/data/providers.csv
-backend/data/docs/
+# Generated data (re-create with `make data`)
+backend/data/
 
-# Logs
-backend/logs/
+# Evaluation reports (CI uploads them as artifacts)
+backend/evals/reports/*
+!backend/evals/reports/.gitkeep
 
-# ChromaDB
-backend/data/chroma_db/
+# Streamlit secrets
+.streamlit/secrets.toml
 
-# Memory (SQLite conversation history)
-backend/data/memory.db
-backend/data/checkpoints.db*
+# Node (diagram rendering)
+node_modules/
 
-# OS
-.DS_Store
-Thumbs.db
-
-# Streamlit
-.streamlit/
-
-# Docs
 STAKEHOLDER_DEMO.md

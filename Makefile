@@ -1,0 +1,63 @@
+.PHONY: help install infra up down migrate seed ingest data api worker ui lint format typecheck test test-integration eval golden models-check diagrams
+
+help:  ## Show targets
+	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+
+install:  ## Install all dependencies (incl. dev)
+	uv sync --all-groups
+
+infra:  ## Start Postgres + Redis only
+	docker compose up -d postgres redis
+
+up:  ## Build and start the full stack
+	docker compose up -d --build
+
+down:  ## Stop the stack
+	docker compose down
+
+migrate:  ## Apply database migrations
+	uv run alembic upgrade head
+
+seed:  ## Generate + load synthetic insurance data, corpus and demo users
+	uv run hg-seed
+
+ingest:  ## Chunk + embed the policy corpus into pgvector
+	uv run hg-ingest
+
+data: migrate seed ingest  ## migrate + seed + ingest
+
+api:  ## Run the API with reload
+	uv run uvicorn backend.main:app --reload --port 8000
+
+worker:  ## Run the background worker
+	uv run arq backend.workers.settings.WorkerSettings
+
+ui:  ## Run the Streamlit UI
+	uv run streamlit run frontend/app.py
+
+lint:  ## Ruff lint
+	uv run ruff check backend frontend tests
+
+format:  ## Ruff format + fix
+	uv run ruff format backend frontend tests && uv run ruff check --fix backend frontend tests
+
+typecheck:  ## mypy
+	uv run mypy backend
+
+test:  ## Unit tests (no network, no infra)
+	uv run pytest -m "not integration and not live"
+
+test-integration:  ## Integration tests (needs `make infra data`)
+	uv run pytest -m integration
+
+golden:  ## Rebuild the golden evaluation dataset from the seeded database
+	uv run hg-build-golden
+
+eval:  ## Offline RAGAS evaluation with the judge ensemble (needs OPENROUTER_API_KEY)
+	uv run hg-eval --suite golden
+
+models-check:  ## Verify configured OpenRouter model slugs exist
+	uv run hg-models-check
+
+diagrams:  ## Render Mermaid architecture diagrams to SVG
+	./docs/render_diagrams.sh
