@@ -30,6 +30,8 @@ backend/data/
 # Evaluation reports (CI uploads them as artifacts)
 backend/evals/reports/*
 !backend/evals/reports/.gitkeep
+# RAGAS judge-response cache (re-runs of unchanged cases cost nothing)
+backend/evals/.cache/
 
 # Streamlit secrets
 .streamlit/secrets.toml

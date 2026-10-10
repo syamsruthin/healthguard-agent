@@ -1,4 +1,4 @@
-.PHONY: help install infra up down migrate seed ingest data api worker ui lint format typecheck test test-integration eval golden models-check diagrams
+.PHONY: help install infra up down migrate seed ingest data api worker ui lint format typecheck test test-integration test-live eval eval-estimate golden models-check chat diagrams
 
 help:  ## Show targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -53,8 +53,17 @@ test-integration:  ## Integration tests (needs `make infra data`)
 golden:  ## Rebuild the golden evaluation dataset from the seeded database
 	uv run hg-build-golden
 
-eval:  ## Offline RAGAS evaluation with the judge ensemble (needs OPENROUTER_API_KEY)
-	uv run hg-eval --suite golden
+test-live:  ## One real turn per persona (spends OpenRouter credit, ~$0.20)
+	HG_LIVE=1 uv run pytest -m live
+
+eval-estimate:  ## Print the plan + cost estimate for an eval run (LIMIT=n JUDGES=n), no model calls
+	uv run hg-eval --suite golden --dry-run --limit $(or $(LIMIT),10) --judges $(or $(JUDGES),0)
+
+eval:  ## Offline RAGAS evaluation with the judge jury (spends credit; LIMIT=n, default 10)
+	uv run hg-eval --suite golden --limit $(or $(LIMIT),10) --judges $(or $(JUDGES),0)
+
+chat:  ## Run agent turns in the terminal: make chat AS=maria.garcia@demo.healthguard.dev Q="..."
+	uv run hg-chat --as $(AS) "$(Q)"
 
 models-check:  ## Verify configured OpenRouter model slugs exist
 	uv run hg-models-check

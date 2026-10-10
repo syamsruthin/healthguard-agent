@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, ClassVar
 
+from arq import func
 from arq.connections import RedisSettings
 
 from backend.agents.tools import sandbox
@@ -34,6 +35,9 @@ class WorkerSettings:
         tasks.summarize_conversation,
         tasks.extract_memories,
         tasks.online_eval,
+        func(
+            tasks.run_offline_eval, timeout=3 * 3600
+        ),  # a full golden run takes far longer than a chat follow-up
     ]
     redis_settings = RedisSettings.from_dsn(settings.redis_url)
     on_startup = startup

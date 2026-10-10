@@ -1,0 +1,12 @@
+# Quality gate for `hg-eval`: the run fails (exit code 1) when any computed metric is below its threshold.
+# RAGAS metrics are the mean over the judge jury; checks are deterministic.
+faithfulness: 0.85
+answer_relevancy: 0.80
+context_recall: 0.75
+context_precision: 0.70
+factual_correctness: 0.60
+route_accuracy: 0.90
+refusal_accuracy: 1.0
+isolation: 1.0
+content_accuracy: 0.80
+answer_rate: 0.90

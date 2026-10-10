@@ -9,7 +9,7 @@ BACKEND = Path(__file__).resolve().parents[2] / "backend"
 
 
 def test_every_enqueued_job_has_a_worker_function() -> None:
-    registered = {f.__name__ for f in WorkerSettings.functions}
+    registered = {getattr(f, "name", None) or f.__name__ for f in WorkerSettings.functions}
     enqueued: set[str] = set()
     for path in BACKEND.rglob("*.py"):
         enqueued |= set(re.findall(r"\.enqueue\(\s*\"(\w+)\"", path.read_text()))

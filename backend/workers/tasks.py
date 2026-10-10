@@ -124,6 +124,14 @@ async def extract_memories(
     return await _accounted(run)
 
 
+async def run_offline_eval(ctx: dict[str, Any], run_id: str, limit: int | None = None) -> dict[str, Any]:
+    """Golden-suite evaluation started from the admin UI (judge calls are not usage-accounted)."""
+    from backend.evals.run import execute  # heavy import (RAGAS) only when an eval actually runs
+
+    outcome = await execute(run_id=uuid.UUID(run_id), limit=limit)
+    return {"run_id": outcome["run_id"], "passed": outcome["passed"], "report": outcome["report"]}
+
+
 async def online_eval(
     ctx: dict[str, Any], message_id: str, reason: str = "sample"
 ) -> dict[str, float] | None:

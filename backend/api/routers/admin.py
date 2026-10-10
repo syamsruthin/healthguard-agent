@@ -3,7 +3,8 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, status
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -12,6 +13,7 @@ from backend.core.errors import NotFoundError
 from backend.db.models import EvalRun, Trace, User
 from backend.db.session import get_session
 from backend.services import metrics_service
+from backend.workers.queue import get_enqueuer
 
 router = APIRouter(prefix="/admin", tags=["admin"], dependencies=[Depends(require_admin)])
 
@@ -36,6 +38,21 @@ async def get_trace(trace_id: uuid.UUID, session: AsyncSession = Depends(get_ses
         "created_at": trace.created_at.isoformat(),
         "steps": trace.steps,
     }
+
+
+class EvalRunIn(BaseModel):
+    limit: int | None = Field(default=10, ge=1, le=500, description="Golden cases to run (None = all)")
+
+
+@router.post("/evals/run", status_code=status.HTTP_202_ACCEPTED)
+async def start_eval(
+    body: EvalRunIn, admin: User = Depends(require_admin), session: AsyncSession = Depends(get_session)
+) -> dict[str, Any]:
+    run = EvalRun(suite="golden", status="queued", config={"limit": body.limit}, triggered_by=admin.id)
+    session.add(run)
+    await session.commit()
+    await get_enqueuer().enqueue("run_offline_eval", str(run.id), body.limit, job_id=f"eval:{run.id}")
+    return {"id": str(run.id), "status": run.status}
 
 
 @router.get("/evals/runs")

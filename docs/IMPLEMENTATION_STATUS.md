@@ -26,6 +26,7 @@ remaining phases in this order: **P0 baseline → 7 → L0 live smoke → 9 → 
 | L1 Live API verification | ✅ Done | `HG_LIVE=1 pytest -m live`: 7 persona turns + refusal checks through the HTTP API all pass (grounded, cited, no other members' IDs; out-of-scope / injection / cross-member blocked). Prompt cache served 60 % of `understand` and 56 % of SQL-generation prompt tokens; avg turn 9.9 s (p95 26.5 s), ~$0.01 per turn |
 | P12 Streamlit UI | ✅ Done | `st.navigation` pages by role (Chat, My coverage, Memory; admin Observability + Evaluations); httpx client with one-shot token refresh and an SSE parser; streamed answers with live plan/tool progress, answer reset/replace, outcome + cost + prompt-cache badges, sources, optional reasoning view, thumbs feedback; persona quick prompts; dashboards follow the reference data-viz palette (one measure per chart, category day axis). `$` is escaped so amounts are not rendered as LaTeX. 7 UI tests (SSE parser, AppTest pages). Verified in the browser; a full page reload signs the user out (Streamlit session state) |
 | P14 CI hardening | ✅ Done | Every `ci.yml` step reproduced locally on a throwaway database (small seed, hash embeddings): lint, format, mypy, 146 unit + 46 integration tests; combined coverage 80 % with a 78 % gate (CLIs / data generation / ingest are exercised by CI commands and omitted). Data smoke tests for the seeded dataset. Redis search indexes require `REDIS_URL` db 0 (documented) |
+| P11 Evaluations | ✅ Built (not yet run live) | `hg-build-golden` → 59 cases from the seeded DB + corpus (plans, providers, policy RAG, member-scoped per persona, multi-hop, memory follow-ups, out-of-scope, injection, cross-member, admin analytics); `hg-eval` runs each case through the real chat pipeline as its persona (`is_eval` conversations, semantic cache off), deterministic checks (answer rate, refusal accuracy, routing, isolation, required content), RAGAS jury (faithfulness, answer relevancy, context recall by default; 5 metrics available; mean + spread, failing judges tolerated, disk-cached responses), `thresholds.yaml` gate, DB rows + Markdown/JSON reports; `--dry-run` cost estimate (full jury ≈ $2.4, 10 cases / 1 judge ≈ $0.3); admin `POST /admin/evals/run` → worker task. `eval.yml` is manual-only (no nightly spend) |
 
 Fixes made in P0:
 - `prefilter` member-ID check is case-insensitive (`m100004` was slipping through).
@@ -109,7 +110,7 @@ The slugs come from a web search (Oct 2026), not a live API check, because `open
 | 8 | Memory: history window, rolling summary, long-term memories | ✅ Done (session 2) | see §0 |
 | 9 | Auth + API + semantic cache | ✅ Done (session 2) | see §0 |
 | 10 | Background worker (arq) | ✅ Done (session 2) | see §0 |
-| 11 | Evaluations (RAGAS jury, online eval, golden set) | ⬜ Not started (APIs checked) | — |
+| 11 | Evaluations (RAGAS jury, online eval, golden set) | ✅ Built (session 2); live baseline pending | see §0 |
 | 12 | Streamlit multipage UI | ✅ Done (session 2) | see §0 |
 | 13 | Observability wiring, architecture diagrams, docs | ⬜ Telemetry module done; diagrams and docs not started | — |
 | 14 | Test suite | ✅ Done (session 2) | see §0 |
@@ -372,7 +373,7 @@ Written, linted and importable, but **not yet wired into a graph or tested**:
 | ~~Old `frontend/app.py` deleted~~ — new multipage UI (P12) | — | — |
 | `docker-compose.yml` `api` / `worker` / `ui` services point to code that doesn't exist yet | Only the `postgres` and `redis` services are verified; `migrate` depends on the unbuilt image | Phases 9, 10, 12 |
 | `deploy/Dockerfile` never built | Image build unverified | Phase 13 |
-| `pyproject.toml` scripts `hg-eval`, `hg-build-golden` point to missing modules | Those commands fail | Phase 11 |
+| ~~`hg-eval`, `hg-build-golden` missing~~ — implemented (P11) | — | — |
 | `.github/workflows/ci.yml`: every step passes locally (P14); Docker build still unverified | Docker job unverified | Phase 13 |
 | `README.md`, `DEMO_QUESTIONS.md`, `specs/*.md` still describe the old Groq / SQLite / Chroma system | Misleading docs | Phase 13 |
 | ~~Nothing has run against live OpenRouter~~ — verified locally in L0 (slugs, prompt caching, answer quality on 8 scenarios); RAGAS scores still pending | — | Phase 11 |

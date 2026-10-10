@@ -1,13 +1,18 @@
 name: Offline evaluation (RAGAS + judge ensemble)
 
+# Manual only: every run spends OpenRouter credit (≈ $0.04 per case with the 3-judge jury);
+# `hg-eval --dry-run --limit N` prints the estimate.
 on:
   workflow_dispatch:
     inputs:
       limit:
-        description: "Max golden cases to run (blank = all)"
+        description: "Golden cases to run (blank = all 59)"
         required: false
-  schedule:
-    - cron: "17 6 * * *"   # nightly
+        default: "10"
+      judges:
+        description: "Judges from EVAL_JUDGES to use (0 = all)"
+        required: false
+        default: "0"
 
 jobs:
   eval:
@@ -45,7 +50,7 @@ jobs:
           uv run hg-seed
           uv run hg-ingest
       - name: Run golden suite (fails on threshold regression)
-        run: uv run hg-eval --suite golden ${{ github.event.inputs.limit && format('--limit {0}', github.event.inputs.limit) || '' }}
+        run: uv run hg-eval --suite golden --judges ${{ github.event.inputs.judges || 0 }} ${{ github.event.inputs.limit && format('--limit {0}', github.event.inputs.limit) || '' }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:

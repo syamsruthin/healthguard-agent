@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 
 from backend.agents.graph import get_graph
 from backend.core.redis import get_redis
-from backend.db.models import LLMCall, Message, Trace
+from backend.db.models import EvalRun, LLMCall, Message, Trace
 from backend.db.session import SessionLocal
 from tests.integration.api.conftest import API, TEST_TITLE, auth, login, parse_sse, register
 
@@ -223,3 +223,20 @@ async def test_admin_endpoints_require_admin(client, fake_llm) -> None:
     trace = await client.get(f"{API}/admin/traces/{final['trace_id']}", headers=auth(admin))
     assert trace.status_code == 200 and trace.json()["steps"]
     assert (await client.get(f"{API}/admin/evals/runs", headers=auth(admin))).status_code == 200
+
+
+async def test_admin_can_queue_an_eval_run(client, jobs) -> None:
+    member = await login(client, "maria.garcia@demo.healthguard.dev")
+    assert (
+        await client.post(f"{API}/admin/evals/run", json={"limit": 5}, headers=auth(member))
+    ).status_code == 403
+    admin = await login(client, "admin@demo.healthguard.dev")
+    resp = await client.post(f"{API}/admin/evals/run", json={"limit": 5}, headers=auth(admin))
+    assert resp.status_code == 202 and resp.json()["status"] == "queued"
+    run_id = resp.json()["id"]
+    assert ("run_offline_eval", (run_id, 5), f"eval:{run_id}") in jobs.jobs
+    runs = (await client.get(f"{API}/admin/evals/runs", headers=auth(admin))).json()
+    assert runs[0]["id"] == run_id and runs[0]["status"] == "queued"
+    async with SessionLocal() as session:
+        await session.delete(await session.get(EvalRun, uuid.UUID(run_id)))
+        await session.commit()
