@@ -16,7 +16,7 @@ from backend.core.config import settings
 from backend.core.logging import get_logger
 from backend.core.telemetry import TOOL_EVENTS
 from backend.db.session import get_agent_pool
-from backend.llm.client import get_llm, strip_fences
+from backend.llm.client import LLMError, get_llm, strip_fences
 from backend.llm.prompts.sql import build_sql_messages
 from backend.llm.registry import Role
 
@@ -55,6 +55,7 @@ async def run_sql_tool(step_id: str, task: str, user: UserContext, prior: str = 
     t0 = time.monotonic()
     llm = get_llm()
     error = ""
+    error_code = ""
     sql = ""
     attempts = 0
     for attempt in range(settings.max_tool_retries + 1):
@@ -84,13 +85,17 @@ async def run_sql_tool(step_id: str, task: str, user: UserContext, prior: str = 
                 duration_ms=int((time.monotonic() - t0) * 1000),
             )
         except SQLGuardError as exc:
-            error = f"Rejected by the SQL safety guard: {exc}. SQL was:\n{sql}"
+            error, error_code = f"Rejected by the SQL safety guard: {exc}. SQL was:\n{sql}", "guard_rejected"
             TOOL_EVENTS.labels(tool="sql", outcome="guard_rejected").inc()
-        except Exception as exc:  # DB errors, LLM errors
-            if exc.__class__.__name__ == "LLMError":
-                error = str(exc)
-                break
-            error = f"Database error: {str(exc).splitlines()[0][:300]}. SQL was:\n{sql}"
+        except LLMError as exc:
+            error, error_code = str(exc), "llm_unavailable"
+            TOOL_EVENTS.labels(tool="sql", outcome="llm_unavailable").inc()
+            break
+        except Exception as exc:  # database errors
+            error, error_code = (
+                f"Database error: {str(exc).splitlines()[0][:300]}. SQL was:\n{sql}",
+                "db_error",
+            )
             TOOL_EVENTS.labels(tool="sql", outcome="db_error").inc()
         log.info("sql_tool_retry", step=step_id, attempt=attempts, error=error[:200])
     return ToolResult(
@@ -100,6 +105,7 @@ async def run_sql_tool(step_id: str, task: str, user: UserContext, prior: str = 
         ok=False,
         code=sql,
         error=error,
+        error_code=error_code,
         attempts=attempts,
         duration_ms=int((time.monotonic() - t0) * 1000),
     )

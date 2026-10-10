@@ -10,7 +10,7 @@ import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from functools import wraps
-from typing import Any
+from typing import Any, Protocol
 
 from langgraph.config import get_stream_writer
 
@@ -49,7 +49,10 @@ def step(
     }
 
 
-NodeFn = Callable[[AgentState], Awaitable[dict[str, Any]]]
+class NodeFn(Protocol):
+    """A graph node; the parameter must be named `state` to match LangGraph's node protocol."""
+
+    def __call__(self, state: AgentState) -> Awaitable[dict[str, Any]]: ...
 
 
 def traced(node: str, status: str) -> Callable[[NodeFn], NodeFn]:

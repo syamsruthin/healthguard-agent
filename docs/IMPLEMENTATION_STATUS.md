@@ -18,6 +18,7 @@ remaining phases in this order: **P0 baseline → 7 → L0 live smoke → 9 → 
 | Step | Status | Notes |
 |---|---|---|
 | P0 Baseline | ✅ Done | `uv sync` on the locked toolchain; migrate + seed + ingest verified locally; `hg-models-check` passes against the live catalog (all 4 chat slugs exist); `backend/main.py` replaced by a minimal app factory (`/health/live`); ruff, format and mypy clean; `tests/` scaffold with 72 unit + 11 integration tests (SQL guard, sandbox, chunking, RRF, prompt-cache markers, usage, exact cache, JWT, guardrails, sources, registry, FakeLLM, RLS matrix, sandbox run, hybrid search) |
+| P7 Agent graph | ✅ Done | `backend/agents/{planning,graph,runner}.py`, `nodes/{understand,cache_lookup,execute,synthesize,verify}.py`, `backend/cache/semantic.py`, `hg-chat` CLI; 32 graph/planning/cache unit tests + Postgres checkpointer and Redis 8 vector-cache integration tests |
 
 Fixes made in P0:
 - `prefilter` member-ID check is case-insensitive (`m100004` was slipping through).
@@ -25,6 +26,15 @@ Fixes made in P0:
 - `FakeLLM` can script exceptions (for failure-path tests).
 - **Sandbox cold start no longer counts against the user-code timeout.** Spawning a worker (pandas import + CSV load) takes ~6 s, so the first provider query after a restart could hit the 10 s limit. New `sandbox.warm_up()` starts the pool with its own 120 s startup limit.
 - `docker-compose.yml`: Postgres host port is configurable (`POSTGRES_HOST_PORT`, default 5432) for machines that already run a native Postgres.
+
+P7 notes (design decisions beyond §4):
+- `execute` runs each dependency level with `asyncio.gather` inside one node (the state has no reducers, so parallel LangGraph branches would conflict); each step has a wall-clock limit (`TOOL_STEP_TIMEOUT_SECONDS`).
+- `planning.sanitize_plan` repairs untrusted plans (unknown tools, duplicate ids, forward/self/unknown dependencies, step budget); replan rounds prefix ids with `r{n}-`.
+- `ToolResult.error_code` lets the graph tell a model outage (`llm_unavailable` fallback) from missing data (`no_data`).
+- New outcome `insufficient` (answer replaced by the verifier); `VERIFY_REPLACE_UNGROUNDED=false` downgrades that to a log line.
+- The verifier now sees recent conversation turns, and synthesis sees remembered preferences (style only). `PROMPT_VERSION` → `2026.10.2`.
+- Semantic cache: RedisVL `AsyncSearchIndex` on a non-decoding client, index named after the embedding model + dimension; scope rules plus an identity check that moves a "public" answer mentioning the user to their member scope; only verified, fully successful turns are stored.
+- `uv.lock` regenerated: it still listed `langchain-openai`, which `pyproject.toml` no longer declares.
 
 ## 1. Decisions confirmed with the user
 
@@ -66,7 +76,7 @@ The slugs come from a web search (Oct 2026), not a live API check, because `open
 | 4 | OpenRouter LLM layer, prompt caching, prompts, usage accounting | ✅ Done (offline-verified only) | `80fdde7` |
 | 5 | RAG: chunking, ingestion, hybrid retrieval | ✅ Done (hash embedder only) | `a718a96` |
 | 6 | Hardened tools: SQL guard + RLS execution, pandas sandbox, policy search | ✅ Done and verified | `a718a96` |
-| 7 | Agent graph rewrite (LangGraph) | 🟡 Started: state, guardrails, sources and trace modules only | this commit |
+| 7 | Agent graph rewrite (LangGraph) | ✅ Done (session 2) | see §0 |
 | 8 | Memory: history window, rolling summary, long-term memories | ⬜ Not started | — |
 | 9 | Auth + API + semantic cache | ⬜ Not started (design settled) | — |
 | 10 | Background worker (arq) | ⬜ Not started | — |

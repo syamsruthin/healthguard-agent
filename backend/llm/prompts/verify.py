@@ -21,9 +21,12 @@ def _static() -> str:
 Return ONLY JSON matching: {schema}"""
 
 
-def build_verify_messages(*, question: str, sources: str, answer: str, profile: str) -> list[dict]:
+def build_verify_messages(
+    *, question: str, sources: str, answer: str, profile: str, history: str = ""
+) -> list[dict]:
+    convo = f"<conversation>\n{history}\n</conversation>\n\n" if history else ""
     body = (
-        f"<user_profile>\n{profile}\n</user_profile>\n\n<question>\n{question}\n</question>\n\n"
+        f"<user_profile>\n{profile}\n</user_profile>\n\n{convo}<question>\n{question}\n</question>\n\n"
         f"<sources>\n{sources}\n</sources>\n\n<answer>\n{answer}\n</answer>"
     )
     return [

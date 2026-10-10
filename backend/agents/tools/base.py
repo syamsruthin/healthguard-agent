@@ -161,6 +161,8 @@ class ToolResult:
     formatted: str = ""
     chunks: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
+    # llm_unavailable | guard_rejected | db_error | sandbox_error | retrieval_error | timeout | dependency_failed
+    error_code: str | None = None
     attempts: int = 1
     duration_ms: int = 0
 

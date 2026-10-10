@@ -126,6 +126,10 @@ class Settings(BaseSettings):
     rag_top_k: int = 6
     rag_candidate_k: int = 20
     rag_rerank: bool = False
+    tool_step_timeout_seconds: float = 90.0  # wall clock per plan step (includes self-correction retries)
+    # Replace answers the verifier judges ungrounded with the insufficient-context fallback
+    # (false = keep the answer and only log the verdict).
+    verify_replace_ungrounded: bool = True
 
     # ── Memory ───────────────────────────────────────────────────────────
     history_token_budget: int = 2_500

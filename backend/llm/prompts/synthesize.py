@@ -33,10 +33,16 @@ def build_synthesis_messages(
     sources: str,
     history: str = "",
     summary: str = "",
+    memories: str = "",
     no_tools: bool = False,
 ) -> list[dict]:
     messages: list[dict] = [{"role": "system", "content": _STATIC, "cache": True}]
     convo = []
+    if memories:
+        convo.append(
+            "<user_preferences>\nRemembered preferences (use for tone, language and defaults only; never as facts "
+            f"about coverage, claims or costs):\n{memories}\n</user_preferences>"
+        )
     if summary:
         convo.append(f"<conversation_summary>\n{summary}\n</conversation_summary>")
     if history:

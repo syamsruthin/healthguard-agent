@@ -32,7 +32,8 @@ class AgentState(TypedDict, total=False):
     # ── Output ──
     answer: str
     verification: dict[str, Any]
-    outcome: str  # answered | blocked | smalltalk | cache_hit | error
+    outcome: str  # answered | smalltalk | blocked | cache_hit | insufficient | error
+    fallback: str  # FALLBACKS key used for the final answer, if any
     block_reason: str
     cache_hit: bool
     cache_scope: str
@@ -72,6 +73,7 @@ def initial_state(
         answer="",
         verification={},
         outcome="",
+        fallback="",
         block_reason="",
         cache_hit=False,
         cache_scope="",

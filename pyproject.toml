@@ -77,6 +77,7 @@ hg-ingest = "backend.rag.ingest:main"
 hg-eval = "backend.evals.run:main"
 hg-build-golden = "backend.evals.build_golden:main"
 hg-models-check = "backend.scripts.models_check:main"
+hg-chat = "backend.scripts.chat_cli:main"
 
 [build-system]
 requires = ["hatchling"]

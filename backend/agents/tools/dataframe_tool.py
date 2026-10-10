@@ -12,7 +12,7 @@ from backend.agents.tools.sandbox import SandboxError, run_code
 from backend.core.config import settings
 from backend.core.logging import get_logger
 from backend.core.telemetry import TOOL_EVENTS
-from backend.llm.client import get_llm, strip_fences
+from backend.llm.client import LLMError, get_llm, strip_fences
 from backend.llm.prompts.dataframe import build_dataframe_messages
 from backend.llm.registry import Role
 
@@ -40,6 +40,7 @@ async def run_dataframe_tool(step_id: str, task: str, user: UserContext, prior: 
     t0 = time.monotonic()
     llm = get_llm()
     error = ""
+    error_code = ""
     code = ""
     attempts = 0
     for attempt in range(settings.max_tool_retries + 1):
@@ -71,13 +72,18 @@ async def run_dataframe_tool(step_id: str, task: str, user: UserContext, prior: 
                 duration_ms=int((time.monotonic() - t0) * 1000),
             )
         except SandboxError as exc:
-            error = f"Sandbox rejected or failed the code: {exc}. Code was:\n{code}"
+            error, error_code = (
+                f"Sandbox rejected or failed the code: {exc}. Code was:\n{code}",
+                "sandbox_error",
+            )
             TOOL_EVENTS.labels(tool="providers", outcome="sandbox_error").inc()
+        except LLMError as exc:
+            error, error_code = str(exc), "llm_unavailable"
+            TOOL_EVENTS.labels(tool="providers", outcome="llm_unavailable").inc()
+            break
         except Exception as exc:
-            if exc.__class__.__name__ == "LLMError":
-                error = str(exc)
-                break
             error = f"Execution error: {exc.__class__.__name__}: {str(exc)[:300]}. Code was:\n{code}"
+            error_code = "sandbox_error"
             TOOL_EVENTS.labels(tool="providers", outcome="exec_error").inc()
         log.info("providers_tool_retry", step=step_id, attempt=attempts, error=error[:200])
     return ToolResult(
@@ -87,6 +93,7 @@ async def run_dataframe_tool(step_id: str, task: str, user: UserContext, prior: 
         ok=False,
         code=code,
         error=error,
+        error_code=error_code,
         attempts=attempts,
         duration_ms=int((time.monotonic() - t0) * 1000),
     )

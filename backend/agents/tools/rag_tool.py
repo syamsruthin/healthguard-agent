@@ -5,8 +5,11 @@ from __future__ import annotations
 import time
 from dataclasses import asdict
 
+import openai
+
 from backend.agents.tools.base import ToolResult, UserContext
 from backend.core.telemetry import TOOL_EVENTS
+from backend.llm.client import LLMError
 from backend.rag.retriever import hybrid_search
 
 
@@ -16,6 +19,8 @@ async def run_policy_search(step_id: str, task: str, user: UserContext, prior: s
     try:
         hits = await hybrid_search(query, plan_id=user.plan_id)
     except Exception as exc:
+        # Embedding failures mean the model gateway is down; anything else is a retrieval fault.
+        upstream = isinstance(exc, LLMError | openai.OpenAIError)
         TOOL_EVENTS.labels(tool="policy_search", outcome="error").inc()
         return ToolResult(
             step_id=step_id,
@@ -23,6 +28,7 @@ async def run_policy_search(step_id: str, task: str, user: UserContext, prior: s
             task=task,
             ok=False,
             error=f"Retrieval failed: {exc.__class__.__name__}",
+            error_code="llm_unavailable" if upstream else "retrieval_error",
             duration_ms=int((time.monotonic() - t0) * 1000),
         )
     TOOL_EVENTS.labels(tool="policy_search", outcome="ok" if hits else "empty").inc()
