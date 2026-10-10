@@ -96,6 +96,7 @@ extend-exclude = ["backend/db/migrations/versions"]
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "S", "ASYNC", "RUF"]
 ignore = [
+    "E501",   # line length is enforced by `ruff format`; long string literals are allowed
     "S101",   # assert is fine in tests
     "S608",   # SQL built from validated identifiers only (see sql_guard)
     "B008",   # FastAPI Depends() in defaults
