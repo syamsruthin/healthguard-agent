@@ -46,14 +46,14 @@ jobs:
       - name: Type check
         run: uv run mypy backend
       - name: Unit tests
-        run: uv run pytest -m "not integration and not live" --cov=backend --cov-report=term-missing
+        run: uv run pytest -m "not integration and not live" --cov --cov-report=
       - name: Migrate + seed (small) + ingest
         run: |
           uv run alembic upgrade head
           uv run hg-seed --scale small
           uv run hg-ingest
-      - name: Integration tests
-        run: uv run pytest -m integration
+      - name: Integration tests (+ combined coverage gate)
+        run: uv run pytest -m integration --cov --cov-append --cov-report=term-missing:skip-covered --cov-fail-under=78
 
   docker:
     runs-on: ubuntu-latest

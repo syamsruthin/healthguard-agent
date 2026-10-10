@@ -130,3 +130,16 @@ markers = [
     "live: requires a real OPENROUTER_API_KEY and network access to openrouter.ai",
 ]
 addopts = "-ra"
+
+[tool.coverage.run]
+source = ["backend", "frontend"]
+omit = [
+    "backend/db/migrations/*",
+    "backend/scripts/*",        # CLIs exercised directly by CI (hg-models-check, hg-chat)
+    "backend/data_gen/*",       # exercised by `hg-seed` in CI, verified by the data smoke tests
+    "backend/rag/ingest.py",    # exercised by `hg-ingest` in CI
+]
+
+[tool.coverage.report]
+skip_empty = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "@overload"]
