@@ -5,7 +5,7 @@ Conversation context for a turn.
   newest first until `HISTORY_TOKEN_BUDGET` is used (assistant replies are
   truncated; they are long and the user's wording matters more)
 * the conversation's rolling summary of older turns
-* long-term memories (added by the memory module)
+* the user's long-term memories most similar to the new message (if enabled)
 """
 
 from __future__ import annotations
@@ -17,8 +17,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.core.config import settings
+from backend.core.logging import get_logger
 from backend.core.tokens import count_tokens
 from backend.db.models import Conversation, Message, User
+from backend.llm.embeddings import embed_query
+from backend.memory.long_term import format_memories, search
+
+log = get_logger(__name__)
 
 ASSISTANT_CHARS = 1_200
 
@@ -74,4 +79,12 @@ async def build_context(
     msgs = await history_messages(session, conversation, exclude_message_id=exclude_message_id)
     lines = [format_turn(m.role, m.content) for m in msgs]
     _, window = split_window(lines, settings.history_token_budget)
-    return MemoryContext(recent_turns="\n".join(window), summary=conversation.summary or "")
+    memories = ""
+    if user.memory_enabled:
+        try:
+            memories = format_memories(await search(session, user.id, await embed_query(message)))
+        except Exception as exc:  # memory is an enhancement; never fail the turn for it
+            log.warning("memory_search_failed", error=str(exc)[:200])
+    return MemoryContext(
+        recent_turns="\n".join(window), summary=conversation.summary or "", memories=memories
+    )

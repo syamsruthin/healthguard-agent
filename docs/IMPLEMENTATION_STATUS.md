@@ -21,6 +21,7 @@ remaining phases in this order: **P0 baseline → 7 → L0 live smoke → 9 → 
 | P7 Agent graph | ✅ Done | `backend/agents/{planning,graph,runner}.py`, `nodes/{understand,cache_lookup,execute,synthesize,verify}.py`, `backend/cache/semantic.py`, `hg-chat` CLI; 32 graph/planning/cache unit tests + Postgres checkpointer and Redis 8 vector-cache integration tests |
 | L0 Live smoke test | ✅ Done | First run against live OpenRouter; corpus re-embedded with `openai/text-embedding-3-small`; 8/8 persona scenarios answered, grounded and complete (see below) |
 | P9 Auth + API | ✅ Done | App factory + lifespan; pure-ASGI request-id / security-header / body-size middleware; JWT auth with refresh rotation + reuse detection; conversations CRUD (soft delete + checkpoint cleanup); JSON and SSE chat; feedback; coverage card; admin metrics / traces / eval runs; Redis rate limits; arq enqueue seam. 17 API integration tests; live SSE turn verified through `uvicorn` |
+| P8 Memory | ✅ Done | Token-budgeted window + rolling summary (`summary_upto` so window and summary never overlap); long-term memories with a deterministic privacy filter (IDs, amounts, dates, contacts, clinical terms), duplicate check (cosine > 0.9), 50-per-user cap, pgvector retrieval at the minimum similarity; `/me/memories` list / delete / clear and `PATCH /me/settings`. 25 tests |
 
 Fixes made in P0:
 - `prefilter` member-ID check is case-insensitive (`m100004` was slipping through).
@@ -101,7 +102,7 @@ The slugs come from a web search (Oct 2026), not a live API check, because `open
 | 5 | RAG: chunking, ingestion, hybrid retrieval | ✅ Done (hash embedder only) | `a718a96` |
 | 6 | Hardened tools: SQL guard + RLS execution, pandas sandbox, policy search | ✅ Done and verified | `a718a96` |
 | 7 | Agent graph rewrite (LangGraph) | ✅ Done (session 2) | see §0 |
-| 8 | Memory: history window, rolling summary, long-term memories | ⬜ Not started | — |
+| 8 | Memory: history window, rolling summary, long-term memories | ✅ Done (session 2) | see §0 |
 | 9 | Auth + API + semantic cache | ✅ Done (session 2) | see §0 |
 | 10 | Background worker (arq) | ⬜ Not started | — |
 | 11 | Evaluations (RAGAS jury, online eval, golden set) | ⬜ Not started (APIs checked) | — |
