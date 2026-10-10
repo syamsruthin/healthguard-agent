@@ -38,7 +38,9 @@ ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONDONTWRITEBYTECODE=1 \
     LOG_JSON=true
 
-RUN mkdir -p /app/backend/data && chown -R app:app /app/backend/data
+ENV TIKTOKEN_CACHE_DIR=/app/.tiktoken
+RUN python -c "import tiktoken; tiktoken.get_encoding('cl100k_base')" \
+    && mkdir -p /app/backend/data && chown -R app:app /app/backend/data /app/.tiktoken
 USER app
 
 EXPOSE 8000 8501

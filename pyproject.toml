@@ -108,6 +108,7 @@ ignore = [
 "backend/core/config.py" = ["S105"]  # dev-only defaults; production guard rejects them
 "backend/data_gen/**" = ["E501"]
 "backend/llm/prompts/**" = ["E501"]
+"backend/core/data_sources.py" = ["E501"]  # catalog strings are prompt content
 
 [tool.mypy]
 python_version = "3.12"
