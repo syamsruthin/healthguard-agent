@@ -17,6 +17,7 @@ from backend.main import create_app
 from backend.workers.queue import RecordingEnqueuer, set_enqueuer
 
 API = settings.api_prefix
+TEST_TITLE = "pytest"  # conversations with this title are deleted after the test session
 
 
 @pytest.fixture

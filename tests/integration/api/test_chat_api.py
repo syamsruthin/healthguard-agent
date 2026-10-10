@@ -10,7 +10,7 @@ from backend.agents.graph import get_graph
 from backend.core.redis import get_redis
 from backend.db.models import LLMCall, Message, Trace
 from backend.db.session import SessionLocal
-from tests.integration.api.conftest import API, auth, login, parse_sse, register
+from tests.integration.api.conftest import API, TEST_TITLE, auth, login, parse_sse, register
 
 DENIED_CLAIMS_SQL = "SELECT claim_id, member_id, status, denial_code FROM claims WHERE status = 'denied'"
 
@@ -31,7 +31,7 @@ def script(answer: str = "Your claim was denied for missing prior authorization 
 
 
 async def _conversation(client, tokens) -> str:
-    resp = await client.post(f"{API}/conversations", json={}, headers=auth(tokens))
+    resp = await client.post(f"{API}/conversations", json={"title": TEST_TITLE}, headers=auth(tokens))
     assert resp.status_code == 201
     return resp.json()["id"]
 
