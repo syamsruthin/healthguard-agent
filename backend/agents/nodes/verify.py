@@ -59,8 +59,20 @@ async def verify(state: AgentState) -> dict[str, Any]:
         missing=v.missing,
     )
     if not v.grounded:
+        log.info(
+            "answer_ungrounded", unsupported=v.unsupported_claims[:5], revisions=state.get("revisions", 0)
+        )
+        if state.get("revisions", 0) < settings.max_revisions:
+            # One rewrite without the flagged claims before giving up on the answer.
+            notes = "\n".join(f"- {c}" for c in v.unsupported_claims) or "- (claims not specified)"
+            return {
+                "verification": verdict,
+                "revise": True,
+                "revisions": state.get("revisions", 0) + 1,
+                "revision_notes": notes,
+                "trace": append(state, trace),
+            }
         GUARDRAIL_BLOCKS.labels(reason="ungrounded").inc()
-        log.info("answer_ungrounded", unsupported=v.unsupported_claims[:5])
         if settings.verify_replace_ungrounded:
             answer = FALLBACKS["insufficient_context"]
             emit({"type": "answer_replaced", "answer": answer, "reason": "insufficient_context"})

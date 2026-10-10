@@ -116,6 +116,7 @@ class Settings(BaseSettings):
     # ── Agent behaviour ─────────────────────────────────────────────────
     max_tool_retries: int = 2
     max_replans: int = 1
+    max_revisions: int = 1  # rewrites without unsupported claims before an answer is replaced
     max_plan_steps: int = 4
     sql_statement_timeout_ms: int = 5_000
     sql_max_rows: int = 200

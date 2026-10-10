@@ -47,7 +47,7 @@ class CacheHit:
 
 
 class SemanticCache(Protocol):
-    async def lookup(self, query: str, *, scope: str, data_version: int) -> CacheHit | None: ...
+    async def lookup(self, query: str, *, scopes: list[str], data_version: int) -> CacheHit | None: ...
 
     async def store(
         self, query: str, payload: dict[str, Any], *, scope: str, data_version: int, ttl: int
@@ -66,6 +66,16 @@ def cache_scope(user: UserContext, needs_member_data: bool) -> str | None:
     return "public"
 
 
+def lookup_scopes(user: UserContext, needs_member_data: bool) -> list[str]:
+    """Scopes a lookup may read: a member's own personalised answers come before public ones."""
+    scope = cache_scope(user, needs_member_data)
+    if scope is None:
+        return []
+    if scope == "public" and user.member_id and not user.is_admin:
+        return [f"member:{user.member_id}", "public"]
+    return [scope]
+
+
 def _identity_terms(user: UserContext) -> list[str]:
     terms = [user.full_name, user.email, user.member_id, user.plan_id, user.plan_name]
     terms += [t for name in [user.full_name] if name for t in name.split()]
@@ -74,14 +84,30 @@ def _identity_terms(user: UserContext) -> list[str]:
     return [t for t in terms if t and len(t) >= 3]
 
 
-def store_scope(scope: str, answer: str, user: UserContext) -> str | None:
-    """Scope to store an answer under: a 'public' answer that mentions who the user is becomes private."""
+def store_scope(scope: str, user: UserContext, *texts: str) -> str | None:
+    """Scope to store an answer under.
+
+    A 'public' turn whose answer or rewritten question mentions who the user is
+    (name, member ID, dependents, their plan) was personalised, so it becomes private.
+    """
     if scope != "public":
         return scope
-    lowered = answer.lower()
+    lowered = " ".join(texts).lower()
     if any(re.search(rf"\b{re.escape(t.lower())}\b", lowered) for t in _identity_terms(user)):
         return f"member:{user.member_id}" if user.member_id else None
     return scope
+
+
+def lookup_key(state: dict[str, Any]) -> str:
+    """Text the cache is keyed on.
+
+    A first-turn question is self-contained, so its normalised wording is a stable
+    key; the LLM rewrite varies from run to run and is only needed when the
+    question depends on earlier turns.
+    """
+    if not state.get("recent_turns") and not state.get("summary"):
+        return " ".join(state.get("message", "").lower().split())
+    return state.get("standalone_query") or state.get("message", "")
 
 
 def ttl_for(scope: str) -> int:
@@ -124,12 +150,14 @@ async def maybe_store(
     """Store a finished turn if eligible; returns the scope used (None if not stored). Never raises."""
     if not settings.semantic_cache_enabled or not cacheable(state):
         return None
-    scope = store_scope(state["cache_scope"], state.get("answer", ""), user)
+    scope = store_scope(
+        state["cache_scope"], user, state.get("answer", ""), state.get("standalone_query", "")
+    )
     if scope is None:
         return None
     try:
         await get_semantic_cache().store(
-            state["standalone_query"],
+            state.get("cache_query") or lookup_key(state),
             build_payload(state, source_message_id=source_message_id),
             scope=scope,
             data_version=int(state.get("data_version", 0)),
@@ -183,11 +211,11 @@ class RedisSemanticCache:
                 await self._index.create(overwrite=False)
             self._ready = True
 
-    async def lookup(self, query: str, *, scope: str, data_version: int) -> CacheHit | None:
+    async def lookup(self, query: str, *, scopes: list[str], data_version: int) -> CacheHit | None:
         await self.ensure_index()
         vector = await embed_query(query)
         flt = (
-            (Tag("scope") == scope)
+            (Tag("scope") == scopes)
             & (Tag("data_version") == str(data_version))
             & (Tag("prompt_version") == PROMPT_VERSION)
         )
@@ -245,15 +273,15 @@ class InMemorySemanticCache:
     async def ensure_index(self) -> None:
         return None
 
-    async def lookup(self, query: str, *, scope: str, data_version: int) -> CacheHit | None:
+    async def lookup(self, query: str, *, scopes: list[str], data_version: int) -> CacheHit | None:
         vector = await embed_query(query)
         now = time.monotonic()
         best: CacheHit | None = None
         for e in self.entries:
-            if e["expires"] < now or (e["scope"], e["data_version"], e["prompt_version"]) != (
-                scope,
-                data_version,
-                PROMPT_VERSION,
+            if (
+                e["expires"] < now
+                or e["scope"] not in scopes
+                or (e["data_version"], e["prompt_version"]) != (data_version, PROMPT_VERSION)
             ):
                 continue
             distance = 1.0 - cosine(vector, e["embedding"])

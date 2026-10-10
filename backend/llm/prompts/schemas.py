@@ -32,7 +32,12 @@ class Verification(BaseModel):
     complete: bool = Field(
         description="All parts of the question are answered (or honestly marked unavailable)"
     )
-    unsupported_claims: list[str] = Field(default_factory=list)
+    unsupported_claims: list[str] = Field(
+        default_factory=list, description="Material claims not supported by the sources"
+    )
+    minor_issues: list[str] = Field(
+        default_factory=list, description="Harmless imprecision that does not affect groundedness"
+    )
     missing: str = Field(default="", description="What is missing, phrased as a follow-up retrieval need")
     reason: str = ""
 

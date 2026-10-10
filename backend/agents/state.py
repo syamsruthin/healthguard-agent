@@ -23,6 +23,9 @@ class AgentState(TypedDict, total=False):
     plan: list[dict[str, Any]]
     replans: int
     feedback: str
+    revisions: int  # rewrites requested by the verifier
+    revise: bool  # a rewrite is pending
+    revision_notes: str
 
     # ── Execution ──
     results: list[dict[str, Any]]  # ToolResult.as_dict()
@@ -37,6 +40,7 @@ class AgentState(TypedDict, total=False):
     block_reason: str
     cache_hit: bool
     cache_scope: str
+    cache_query: str  # text the semantic cache was keyed on
     trace: list[dict[str, Any]]
 
 
@@ -67,6 +71,9 @@ def initial_state(
         plan=[],
         replans=0,
         feedback="",
+        revisions=0,
+        revise=False,
+        revision_notes="",
         results=[],
         sources_text="",
         citations=[],
@@ -77,5 +84,6 @@ def initial_state(
         block_reason="",
         cache_hit=False,
         cache_scope="",
+        cache_query="",
         trace=[],
     )

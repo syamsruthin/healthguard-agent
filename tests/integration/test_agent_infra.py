@@ -49,18 +49,24 @@ async def test_redis_semantic_cache_roundtrip_and_isolation() -> None:
         await cache.store(
             "how do I appeal a denied claim", {"answer": "A"}, scope="public", data_version=version, ttl=60
         )
-        hit = await cache.lookup("how do I appeal a denied claim", scope="public", data_version=version)
+        hit = await cache.lookup("how do I appeal a denied claim", scopes=["public"], data_version=version)
         assert hit is not None and hit.payload == {"answer": "A"} and hit.distance < 0.01
+        multi = await cache.lookup(
+            "how do I appeal a denied claim", scopes=["member:M100001", "public"], data_version=version
+        )
+        assert multi is not None and multi.payload == {"answer": "A"}
         assert (
-            await cache.lookup("how do I appeal a denied claim", scope="member:M100001", data_version=version)
+            await cache.lookup(
+                "how do I appeal a denied claim", scopes=["member:M100001"], data_version=version
+            )
             is None
         )
         assert (
-            await cache.lookup("how do I appeal a denied claim", scope="public", data_version=version + 1)
+            await cache.lookup("how do I appeal a denied claim", scopes=["public"], data_version=version + 1)
             is None
         )
         assert (
-            await cache.lookup("find a dermatologist in Seattle", scope="public", data_version=version)
+            await cache.lookup("find a dermatologist in Seattle", scopes=["public"], data_version=version)
             is None
         )
     finally:

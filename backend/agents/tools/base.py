@@ -135,7 +135,7 @@ class UserContext:
                 await session.execute(
                     text(
                         "SELECT member_id, first_name, relationship_to_subscriber AS relationship, "
-                        "date_part('year', age(DATE :asof, date_of_birth))::int AS age FROM insurance.members "
+                        "date_part('year', age(CAST(:asof AS date), date_of_birth))::int AS age FROM insurance.members "
                         "WHERE subscriber_id = :mid AND member_id <> :mid ORDER BY date_of_birth"
                     ),
                     {"mid": self.member_id, "asof": AS_OF},

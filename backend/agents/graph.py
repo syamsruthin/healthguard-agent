@@ -5,6 +5,8 @@ The HealthGuard agent graph (LangGraph).
                         ├─ small talk (empty plan) → synthesize ──────────→ finalize
                         └─ cache_lookup ─┬─ hit ──────────────────────────→ finalize
                                          └─ execute → synthesize → verify ┬→ finalize
+                                                                          ├→ synthesize (rewrite without
+                                                                          │  unsupported claims, once)
                                                                           └→ replan → understand → execute …
 
 `thread_id` is the conversation id. Every turn starts from `initial_state()`,
@@ -63,6 +65,8 @@ def route_after_verify(state: AgentState) -> str:
     v = state.get("verification", {})
     if v.get("skipped") or state.get("outcome") == "insufficient":
         return "finalize"
+    if state.get("revise"):
+        return "synthesize"
     if not v.get("complete", True) and v.get("missing") and state.get("replans", 0) < settings.max_replans:
         return "replan"
     return "finalize"
@@ -87,7 +91,7 @@ def build_graph(
     g.add_conditional_edges("cache_lookup", route_after_cache, ["finalize", "execute"])
     g.add_conditional_edges("execute", route_after_execute, ["finalize", "synthesize"])
     g.add_conditional_edges("synthesize", route_after_synthesize, ["finalize", "verify"])
-    g.add_conditional_edges("verify", route_after_verify, ["finalize", "replan"])
+    g.add_conditional_edges("verify", route_after_verify, ["finalize", "replan", "synthesize"])
     g.add_edge("replan", "understand")
     g.add_edge("finalize", END)
     return g.compile(checkpointer=checkpointer)

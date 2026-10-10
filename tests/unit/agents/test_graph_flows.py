@@ -275,7 +275,24 @@ async def test_replan_budget_is_respected(fake_llm, tools) -> None:
     assert final["outcome"] == "answered"
 
 
-async def test_ungrounded_answer_is_replaced(fake_llm, tools) -> None:
+async def test_ungrounded_answer_is_rewritten_once(fake_llm, tools) -> None:
+    llm = fake_llm(
+        {
+            "understand": understanding([step("s1")]),
+            "synthesize": ["Met $2,700 [S1]. Call your doctor at 555-0100.", "Met $2,700 [S1]."],
+            "verify": [{**verdict(grounded=False), "unsupported_claims": ["555-0100"]}, verdict()],
+        }
+    )
+    final, events = await run("what is my deductible?")
+    assert llm.names() == ["understand", "synthesize", "verify", "synthesize", "verify"]
+    assert "555-0100" in llm.calls[3]["messages"][-1]["content"]  # revision request lists the claim
+    assert final["outcome"] == "answered" and final["answer"] == "Met $2,700 [S1]."
+    assert final["revisions"] == 1 and final["replans"] == 0
+    resets = [e for e in events if e["type"] == "answer_reset"]
+    assert resets and resets[0]["reason"] == "revision"
+
+
+async def test_answer_still_ungrounded_after_rewrite_is_replaced(fake_llm, tools) -> None:
     fake_llm(
         {
             "understand": understanding([step("s1")]),

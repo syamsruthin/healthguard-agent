@@ -7,6 +7,8 @@ from backend.cache.semantic import (
     InMemorySemanticCache,
     cache_scope,
     cacheable,
+    lookup_key,
+    lookup_scopes,
     store_scope,
     ttl_for,
 )
@@ -42,13 +44,40 @@ def test_scopes() -> None:
     ],
 )
 def test_public_answer_mentioning_identity_becomes_private(answer: str) -> None:
-    assert store_scope("public", answer, MARIA) == "member:M100001"
-    assert store_scope("public", answer.replace("Maria", "Sam Lee"), NO_PROFILE) in ("public", None)
+    assert store_scope("public", MARIA, answer) == "member:M100001"
+    assert store_scope("public", NO_PROFILE, answer.replace("Maria", "Sam Lee")) in ("public", None)
+
+
+def test_personalised_rewrite_makes_turn_private() -> None:
+    rewrite = "How does external review work under my PPO-SLV-PLS plan?"
+    assert store_scope("public", MARIA, "Generic answer.", rewrite) == "member:M100001"
 
 
 def test_identity_answer_without_member_profile_is_not_cached() -> None:
-    assert store_scope("public", "Sam, appeals are due in 180 days.", NO_PROFILE) is None
-    assert store_scope("public", "Appeals are due in 180 days.", MARIA) == "public"
+    assert store_scope("public", NO_PROFILE, "Sam, appeals are due in 180 days.") is None
+    assert store_scope("public", MARIA, "Appeals are due in 180 days.") == "public"
+
+
+def test_lookup_key_uses_raw_message_without_context() -> None:
+    state = {"message": "  How do   Appeals work? ", "standalone_query": "LLM rewrite"}
+    assert lookup_key(state) == "how do appeals work?"
+    assert lookup_key({**state, "recent_turns": "User: hi"}) == "LLM rewrite"
+
+
+def test_members_read_their_own_scope_before_public() -> None:
+    assert lookup_scopes(MARIA, needs_member_data=False) == ["member:M100001", "public"]
+    assert lookup_scopes(MARIA, needs_member_data=True) == ["member:M100001"]
+    assert lookup_scopes(NO_PROFILE, needs_member_data=False) == ["public"]
+    assert lookup_scopes(NO_PROFILE, needs_member_data=True) == []
+    assert lookup_scopes(ADMIN, needs_member_data=False) == ["role:admin"]
+
+
+async def test_multi_scope_lookup() -> None:
+    cache = InMemorySemanticCache()
+    await cache.store("my question", {"answer": "mine"}, scope="member:M100001", data_version=1, ttl=60)
+    hit = await cache.lookup("my question", scopes=["member:M100001", "public"], data_version=1)
+    assert hit is not None and hit.payload["answer"] == "mine"
+    assert await cache.lookup("my question", scopes=["member:M100002", "public"], data_version=1) is None
 
 
 def test_ttl_by_scope() -> None:
@@ -89,10 +118,10 @@ def test_only_verified_successful_turns_are_cacheable(override: dict, expected: 
 async def test_in_memory_cache_filters_scope_version_and_ttl() -> None:
     cache = InMemorySemanticCache()
     await cache.store("what is a deductible", {"answer": "A"}, scope="public", data_version=3, ttl=60)
-    hit = await cache.lookup("what is a deductible", scope="public", data_version=3)
+    hit = await cache.lookup("what is a deductible", scopes=["public"], data_version=3)
     assert hit is not None and hit.payload == {"answer": "A"} and hit.distance < 1e-6
-    assert await cache.lookup("what is a deductible", scope="member:M100001", data_version=3) is None
-    assert await cache.lookup("what is a deductible", scope="public", data_version=4) is None
-    assert await cache.lookup("find a cardiologist in Austin", scope="public", data_version=3) is None
+    assert await cache.lookup("what is a deductible", scopes=["member:M100001"], data_version=3) is None
+    assert await cache.lookup("what is a deductible", scopes=["public"], data_version=4) is None
+    assert await cache.lookup("find a cardiologist in Austin", scopes=["public"], data_version=3) is None
     await cache.store("expired question", {"answer": "B"}, scope="public", data_version=3, ttl=-1)
-    assert await cache.lookup("expired question", scope="public", data_version=3) is None
+    assert await cache.lookup("expired question", scopes=["public"], data_version=3) is None

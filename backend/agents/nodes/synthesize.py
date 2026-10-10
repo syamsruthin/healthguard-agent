@@ -43,9 +43,12 @@ async def synthesize(state: AgentState) -> dict[str, Any]:
         summary=state.get("summary", ""),
         memories=state.get("memories", ""),
         no_tools=no_tools,
+        revision_notes=state.get("revision_notes", "") if state.get("revise") else "",
     )
-    if replans:
-        emit({"type": "answer_reset", "round": replans})
+    if state.get("revise"):
+        emit({"type": "answer_reset", "round": replans, "reason": "revision"})
+    elif replans:
+        emit({"type": "answer_reset", "round": replans, "reason": "replan"})
     parts: list[str] = []
     try:
         async for chunk in get_llm().stream(Role.SYNTH, messages, name="synthesize"):
@@ -54,10 +57,11 @@ async def synthesize(state: AgentState) -> dict[str, Any]:
     except Exception as exc:
         log.warning("synthesis_failed", error=str(exc)[:300], replans=replans)
         note = step("synthesize", output=f"model unavailable: {exc.__class__.__name__}")
-        if replans and state.get("answer"):  # restore the previous round's answer
+        if (replans or state.get("revise")) and state.get("answer"):  # restore the previous answer
             emit({"type": "answer_replaced", "answer": state["answer"], "reason": "llm_unavailable"})
             return {
                 "verification": {**state.get("verification", {}), "skipped": True},
+                "revise": False,
                 "trace": append(state, note),
             }
         answer = FALLBACKS["llm_unavailable"]
@@ -77,6 +81,7 @@ async def synthesize(state: AgentState) -> dict[str, Any]:
         "sources_text": sources,
         "citations": used,
         "outcome": "smalltalk" if no_tools else "answered",
+        "revise": False,
         "trace": append(
             state,
             step(

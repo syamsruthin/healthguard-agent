@@ -8,7 +8,7 @@ from typing import Any
 from backend.agents.state import AgentState
 from backend.agents.tools.base import UserContext
 from backend.agents.trace import append, emit, step, traced
-from backend.cache.semantic import cache_scope, get_semantic_cache
+from backend.cache.semantic import cache_scope, get_semantic_cache, lookup_key, lookup_scopes
 from backend.core.config import settings
 from backend.core.logging import get_logger
 from backend.core.telemetry import CACHE_EVENTS
@@ -21,14 +21,19 @@ async def cache_lookup(state: AgentState) -> dict[str, Any]:
     t0 = time.monotonic()
     user = UserContext.from_dict(state["user"])
     scope = cache_scope(user, state.get("needs_member_data", False))
-    query = state.get("standalone_query", "")
+    query = lookup_key(dict(state))
     if not settings.semantic_cache_enabled or scope is None:
         return {
             "cache_scope": scope or "",
+            "cache_query": query,
             "trace": append(state, step("cache_lookup", input=query, output="skipped", scope=scope)),
         }
     try:
-        hit = await get_semantic_cache().lookup(query, scope=scope, data_version=state.get("data_version", 0))
+        hit = await get_semantic_cache().lookup(
+            query,
+            scopes=lookup_scopes(user, state.get("needs_member_data", False)),
+            data_version=state.get("data_version", 0),
+        )
     except Exception as exc:  # the cache must never break a turn
         CACHE_EVENTS.labels(layer="semantic", outcome="error").inc()
         log.warning("semantic_cache_lookup_failed", error=str(exc)[:200])
@@ -38,6 +43,7 @@ async def cache_lookup(state: AgentState) -> dict[str, Any]:
         CACHE_EVENTS.labels(layer="semantic", outcome="miss").inc()
         return {
             "cache_scope": scope,
+            "cache_query": query,
             "trace": append(
                 state, step("cache_lookup", input=query, output="miss", duration_ms=ms, scope=scope)
             ),
@@ -50,6 +56,7 @@ async def cache_lookup(state: AgentState) -> dict[str, Any]:
     return {
         "cache_hit": True,
         "cache_scope": scope,
+        "cache_query": query,
         "outcome": "cache_hit",
         "answer": answer,
         "citations": citations,

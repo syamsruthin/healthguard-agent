@@ -19,6 +19,7 @@ remaining phases in this order: **P0 baseline → 7 → L0 live smoke → 9 → 
 |---|---|---|
 | P0 Baseline | ✅ Done | `uv sync` on the locked toolchain; migrate + seed + ingest verified locally; `hg-models-check` passes against the live catalog (all 4 chat slugs exist); `backend/main.py` replaced by a minimal app factory (`/health/live`); ruff, format and mypy clean; `tests/` scaffold with 72 unit + 11 integration tests (SQL guard, sandbox, chunking, RRF, prompt-cache markers, usage, exact cache, JWT, guardrails, sources, registry, FakeLLM, RLS matrix, sandbox run, hybrid search) |
 | P7 Agent graph | ✅ Done | `backend/agents/{planning,graph,runner}.py`, `nodes/{understand,cache_lookup,execute,synthesize,verify}.py`, `backend/cache/semantic.py`, `hg-chat` CLI; 32 graph/planning/cache unit tests + Postgres checkpointer and Redis 8 vector-cache integration tests |
+| L0 Live smoke test | ✅ Done | First run against live OpenRouter; corpus re-embedded with `openai/text-embedding-3-small`; 8/8 persona scenarios answered, grounded and complete (see below) |
 
 Fixes made in P0:
 - `prefilter` member-ID check is case-insensitive (`m100004` was slipping through).
@@ -35,6 +36,28 @@ P7 notes (design decisions beyond §4):
 - The verifier now sees recent conversation turns, and synthesis sees remembered preferences (style only). `PROMPT_VERSION` → `2026.10.2`.
 - Semantic cache: RedisVL `AsyncSearchIndex` on a non-decoding client, index named after the embedding model + dimension; scope rules plus an identity check that moves a "public" answer mentioning the user to their member scope; only verified, fully successful turns are stored.
 - `uv.lock` regenerated: it still listed `langchain-openai`, which `pyproject.toml` no longer declares.
+
+### L0 live results (2026-10-10, `hg-chat`, exact + semantic caches off)
+
+| Persona / scenario | Plan | Outcome | Cost |
+|---|---|---|---|
+| Maria — April knee MRI denial + appeal | sql ∥ policy_search | answered, grounded, complete; D002, $0 owed, appeal steps cited | $0.023–0.039 |
+| James — Ozempic coverage + dermatology denial | sql, sql ∥ policy_search | answered; PA + step therapy, D010 referral, retro-referral window computed | $0.039–0.040 |
+| Priya — delivery cost + HSA balance | sql ∥ policy_search | answered | $0.035–0.042 |
+| Robert — out-of-network ER (No Surprises Act) | sql ∥ policy_search | answered | $0.022–0.039 |
+| Aisha — external review process | policy_search | answered | $0.011 |
+| David — family urgent care denial | sql ∥ policy_search | answered (D009) | $0.014–0.021 |
+| David — in-network pediatrician with telehealth | providers (sandbox) | answered | $0.026 |
+| Admin — top 5 denial reasons | sql | answered | $0.010 |
+| Maria — 4-turn conversation | — | small talk; deductible ($2,700 of $3,400); "how much more before I hit it?" resolved to $700; "capital of France" blocked out-of-scope for $0.0002 | — |
+
+**Provider prompt caching works:** repeating Maria's turn served 12,051 of 19,201 prompt tokens from cache (understand 4,750 / SQL 5,641 / synthesis and verify static prefixes) and cut the turn cost from $0.038 to $0.023 (−40 %).
+
+**Bugs found and fixed by the live run:**
+- `UserContext.load_member_profile` used `DATE :asof` with a bind parameter (invalid Postgres) — every member login would have failed. Fixed (`CAST(:asof AS date)`) and covered by an integration test.
+- The verifier flagged the Member Services number and the data "as of" date as unsupported claims, replacing correct answers with the insufficient-context fallback. Fixed with a shared `REFERENCE_FACTS` block (contacts + as-of date) in both the synthesis and verify prompts, a stricter definition of a material claim, a `minor_issues` field, and a **one-shot revision**: an ungrounded draft is rewritten without the flagged claims and only replaced if it still fails (`MAX_REVISIONS`).
+- The semantic cache never hit: it was keyed on the LLM's rewritten query, which differs on every run (measured cosine distance 0.18–0.30 between rewrites of the same question vs a 0.08 threshold). It is now keyed on the normalised raw message for self-contained first turns (rewrite only when the turn depends on history); members read their own scope before `public`; a turn whose rewrite mentions the user's plan or identity is stored privately. Live check: a second member asking the same general question got a cached, verified answer for $0.0002 instead of ~$0.01.
+- Paraphrases of a question (distance ≥ 0.18 with this embedding model) do not hit at the 0.08 threshold — by design; the cache targets repeats.
 
 ## 1. Decisions confirmed with the user
 
@@ -346,8 +369,8 @@ Written, linted and importable, but **not yet wired into a graph or tested**:
 | `pyproject.toml` scripts `hg-eval`, `hg-build-golden` point to missing modules | Those commands fail | Phase 11 |
 | `.github/workflows/ci.yml`: lint, format, mypy and both test stages now pass locally (P0); Docker build still unverified | CI expected green except Docker job | Phase 13 |
 | `README.md`, `DEMO_QUESTIONS.md`, `specs/*.md` still describe the old Groq / SQLite / Chroma system | Misleading docs | Phase 13 |
-| **Nothing has run against live OpenRouter** (`openrouter.ai` blocked in the build sandbox) | Model slugs, prompt behaviour, prompt-cache hits and answer quality unverified; no RAGAS scores exist | Needs network access + API key |
-| Retrieval tested only with the lexical `hash` embedder | Real retrieval quality unmeasured | Re-run `hg-ingest --force` with OpenRouter embeddings |
+| ~~Nothing has run against live OpenRouter~~ — verified locally in L0 (slugs, prompt caching, answer quality on 8 scenarios); RAGAS scores still pending | — | Phase 11 |
+| ~~Retrieval tested only with the `hash` embedder~~ — re-ingested with OpenRouter embeddings (L0) | Retrieval quality measured by RAGAS later | Phase 11 |
 | tiktoken couldn't download its encoding in the sandbox; character-based estimate used | Chunk sizes approximate (Docker image pre-fetches the encoding) | — |
 | ~~Tool verification was ad-hoc scripts~~ — ported to pytest (P0) | — | — |
 | Minor data/doc mismatches: the $35 insulin cap is stated but not enforced by the claims engine (no insulin claims are generated); the cardiac-rehab doc says the first 36 sessions don't count toward the therapy limit while the engine counts them (no persona hits the limit) | Cosmetic | Phase 3 follow-up |
