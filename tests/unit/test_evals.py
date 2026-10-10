@@ -8,7 +8,7 @@ import pytest
 from backend.evals.build_golden import money_re
 from backend.evals.checks import aggregate, case_checks
 from backend.evals.ragas_jury import Jury
-from backend.evals.run import estimate_cost, flag_disagreement, select_cases
+from backend.evals.run import estimate_cost, flag_disagreement, judged_question, select_cases
 
 ANSWER_CASE = {
     "expected_outcome": "answered",
@@ -134,3 +134,15 @@ def test_grounding_reaches_faithfulness_only() -> None:
     assert (
         Jury._inputs("faithfulness", "q", "a", [], "ref", ["g"]) is None
     )  # nothing retrieved, nothing to judge
+
+
+def test_follow_ups_are_judged_against_the_resolved_question() -> None:
+    follow_up = {
+        "question": "How much more before I hit it?",
+        "prior_turns": ["What is my deductible status?"],
+    }
+    first_turn = {"question": "What is my deductible?", "prior_turns": []}
+    result = {"standalone_query": "How much more do I need to pay to meet my individual deductible?"}
+    assert judged_question(follow_up, result) == result["standalone_query"]
+    assert judged_question(first_turn, result) == "What is my deductible?"
+    assert judged_question(follow_up, {}) == follow_up["question"]

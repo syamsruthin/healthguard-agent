@@ -40,7 +40,7 @@ ALL_METRICS = (
 )
 CORE_METRICS = ("faithfulness", "answer_relevancy", "context_recall")  # cheapest informative set
 CACHE_DIR = Path(__file__).parent / ".cache"
-JUDGE_MAX_TOKENS = 4096
+JUDGE_MAX_TOKENS = 8192  # long answers produce long claim lists (4,096 still truncated 2 of 21 calls)
 
 
 class Jury:

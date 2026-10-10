@@ -82,6 +82,13 @@ def select_cases(
     return cases[:limit] if limit else cases
 
 
+def judged_question(case: dict[str, Any], result: dict[str, Any]) -> str:
+    """A follow-up ("…before I hit it?") is judged against its resolved, standalone form."""
+    if case.get("prior_turns") and result.get("standalone_query"):
+        return str(result["standalone_query"])
+    return str(case["question"])
+
+
 def estimate_cost(cases: list[dict[str, Any]], metrics: tuple[str, ...], judges: int) -> float:
     turns = sum(1 + len(c.get("prior_turns") or []) for c in cases)
     scored = sum(1 for c in cases if c["expected_outcome"] != "blocked")
@@ -130,6 +137,7 @@ async def run_case(case: dict[str, Any]) -> dict[str, Any]:
         "cache_hit": payload.get("cache_hit", False),
         "contexts": await _sources(payload.get("trace_id")),
         "grounding": grounding,
+        "standalone_query": payload.get("standalone_query", ""),
         "latency_ms": payload.get("latency_ms") or int((time.monotonic() - t0) * 1000),
         "cost_usd": round(cost, 6),
     }
@@ -231,7 +239,7 @@ async def _execute(
                 and result["outcome"] in ("answered", "smalltalk")
             ):
                 scores = await jury.score(
-                    question=case["question"],
+                    question=judged_question(case, result),
                     answer=result["answer"],
                     contexts=result["contexts"],
                     reference=case.get("reference", ""),
@@ -438,18 +446,19 @@ async def _main(args: argparse.Namespace) -> int:
     judges = list(settings.eval_judges)[: args.judges] if args.judges else list(settings.eval_judges)
     categories = args.categories.split(",") if args.categories else None
     cases = select_cases(load(), categories=categories, per_category=args.per_category, limit=args.limit)
-    estimate = estimate_cost(cases, metrics if not args.no_ragas else (), 0 if args.no_ragas else len(judges))
-    print(
-        f"Golden suite: {len(cases)} cases · metrics {list(metrics) if not args.no_ragas else 'none'} · "
-        f"judges {judges if not args.no_ragas else 'none'} · estimated cost ≈ ${estimate:.2f}"
-    )
     if args.rescore:
+        print(f"Re-judging stored answers of run {args.rescore} · metrics {list(metrics)} · judges {judges}")
         try:
             outcome = await rescore(uuid.UUID(args.rescore), metrics=metrics, judges=judges)
         finally:
             await close_redis()
             await dispose()
         return _print_outcome(outcome)
+    estimate = estimate_cost(cases, metrics if not args.no_ragas else (), 0 if args.no_ragas else len(judges))
+    print(
+        f"Golden suite: {len(cases)} cases · metrics {list(metrics) if not args.no_ragas else 'none'} · "
+        f"judges {judges if not args.no_ragas else 'none'} · estimated cost ≈ ${estimate:.2f}"
+    )
     if args.dry_run:
         return 0
     try:
