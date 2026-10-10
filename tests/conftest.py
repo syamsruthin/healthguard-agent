@@ -11,13 +11,13 @@ from __future__ import annotations
 import os
 
 os.environ["ENV"] = "test"
-os.environ["EMBEDDING_PROVIDER"] = "hash"
 os.environ["LLM_EXACT_CACHE_ENABLED"] = "false"
 os.environ["LOG_JSON"] = "false"
 os.environ.setdefault("JWT_SECRET", "test-only-secret-value-that-is-long-enough-123")
 if os.environ.get("HG_LIVE") != "1":
     # Unit and integration tests must never reach a real model.
     os.environ["OPENROUTER_API_KEY"] = ""
+    os.environ["EMBEDDING_PROVIDER"] = "hash"
 
 from collections.abc import Callable, Iterator
 from pathlib import Path
