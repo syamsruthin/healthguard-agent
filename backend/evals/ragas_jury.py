@@ -10,6 +10,7 @@ unchanged cases costs nothing.
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 from statistics import mean
 from typing import Any
@@ -39,6 +40,7 @@ ALL_METRICS = (
 )
 CORE_METRICS = ("faithfulness", "answer_relevancy", "context_recall")  # cheapest informative set
 CACHE_DIR = Path(__file__).parent / ".cache"
+JUDGE_MAX_TOKENS = 4096
 
 
 class Jury:
@@ -56,11 +58,15 @@ class Jury:
             max_retries=settings.llm_max_retries,
             default_headers={"HTTP-Referer": settings.openrouter_app_url, "X-Title": "HealthGuard evals"},
         )
-        cache = DiskCacheBackend(str(CACHE_DIR))
         embeddings = OpenAIEmbeddings(client=client, model=settings.embedding_model)
         self._scorers: dict[str, dict[str, Any]] = {}
         for judge in judges:
-            llm = llm_factory(judge, client=client, adapter="instructor", cache=cache)
+            # One cache per judge so a judge can never be served another judge's response; a generous
+            # output budget because faithfulness lists every claim (the default cap truncated long answers).
+            cache = DiskCacheBackend(str(CACHE_DIR / re.sub(r"[^a-z0-9]+", "_", judge.lower())))
+            llm = llm_factory(
+                judge, client=client, adapter="instructor", cache=cache, max_tokens=JUDGE_MAX_TOKENS
+            )
             self._scorers[judge] = {
                 "faithfulness": Faithfulness(llm=llm),
                 "answer_relevancy": AnswerRelevancy(llm=llm, embeddings=embeddings),
@@ -70,10 +76,16 @@ class Jury:
             }
 
     @staticmethod
-    def _inputs(metric: str, q: str, a: str, ctx: list[str], ref: str) -> dict[str, Any] | None:
-        """Arguments for a metric, or None when the case lacks what the metric needs."""
+    def _inputs(
+        metric: str, q: str, a: str, ctx: list[str], ref: str, grounding: list[str]
+    ) -> dict[str, Any] | None:
+        """Arguments for a metric, or None when the case lacks what the metric needs.
+
+        Faithfulness also sees `grounding` (the member profile and the reference facts the
+        assistant is allowed to use); recall and precision judge retrieval, so they see `ctx` only.
+        """
         if metric == "faithfulness":
-            return {"user_input": q, "response": a, "retrieved_contexts": ctx} if ctx else None
+            return {"user_input": q, "response": a, "retrieved_contexts": [*ctx, *grounding]} if ctx else None
         if metric == "answer_relevancy":
             return {"user_input": q, "response": a}
         if metric == "context_recall":
@@ -94,12 +106,18 @@ class Jury:
                 return None
 
     async def score(
-        self, *, question: str, answer: str, contexts: list[str], reference: str
+        self,
+        *,
+        question: str,
+        answer: str,
+        contexts: list[str],
+        reference: str,
+        grounding: list[str] | None = None,
     ) -> dict[str, dict[str, Any]]:
         """{metric: {"score": mean, "judges": {judge: value}, "spread": max-min}} for applicable metrics."""
         jobs: list[tuple[str, str, Any]] = []
         for metric in self.metrics:
-            kwargs = self._inputs(metric, question, answer, contexts, reference)
+            kwargs = self._inputs(metric, question, answer, contexts, reference, grounding or [])
             if kwargs is None:
                 continue
             for judge in self.judges:

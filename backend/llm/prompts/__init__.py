@@ -10,4 +10,4 @@ Bump PROMPT_VERSION whenever a prompt changes — it is part of the exact
 LLM cache key and the semantic answer cache filter.
 """
 
-PROMPT_VERSION = "2026.10.3"
+PROMPT_VERSION = "2026.10.4"

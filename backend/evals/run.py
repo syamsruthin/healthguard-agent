@@ -28,6 +28,7 @@ from statistics import mean, quantiles
 from typing import Any
 
 import yaml
+from sqlalchemy import select
 
 from backend.agents.tools import sandbox
 from backend.core.config import settings
@@ -40,8 +41,9 @@ from backend.evals.build_golden import DATASET, load
 from backend.evals.checks import aggregate, case_checks
 from backend.evals.ragas_jury import ALL_METRICS, CORE_METRICS, Jury
 from backend.evals.report import write_reports
+from backend.llm.prompts.common import REFERENCE_FACTS
 from backend.services import chat_service, conversation_service
-from backend.services.user_context import get_user_by_email
+from backend.services.user_context import get_user_by_email, load_user_context
 
 log = get_logger(__name__)
 THRESHOLDS = Path(__file__).parent / "thresholds.yaml"
@@ -57,6 +59,27 @@ _JUDGE_CALLS_PER_METRIC = {
     "factual_correctness": 2,
 }
 _JUDGE_CALL_COST = 0.0015
+
+
+def select_cases(
+    cases: list[dict[str, Any]],
+    *,
+    categories: list[str] | None = None,
+    per_category: int | None = None,
+    limit: int | None = None,
+) -> list[dict[str, Any]]:
+    """Filter by category, keep at most `per_category` cases of each (a stratified sample), then cap at `limit`."""
+    if categories:
+        cases = [c for c in cases if c["category"] in categories]
+    if per_category:
+        seen: dict[str, int] = {}
+        kept = []
+        for c in cases:
+            seen[c["category"]] = seen.get(c["category"], 0) + 1
+            if seen[c["category"]] <= per_category:
+                kept.append(c)
+        cases = kept
+    return cases[:limit] if limit else cases
 
 
 def estimate_cost(cases: list[dict[str, Any]], metrics: tuple[str, ...], judges: int) -> float:
@@ -78,6 +101,12 @@ async def _sources(trace_id: str | None) -> list[str]:
     return []
 
 
+async def grounding_for(session: Any, user: Any) -> list[str]:
+    """What the assistant may state without a source tag: the member profile and the reference facts."""
+    ctx = await load_user_context(session, user)
+    return [f"Member profile: {ctx.profile_text()}", REFERENCE_FACTS]
+
+
 async def run_case(case: dict[str, Any]) -> dict[str, Any]:
     """Run one golden case (including prior turns) through the chat pipeline as its persona."""
     t0 = time.monotonic()
@@ -85,6 +114,7 @@ async def run_case(case: dict[str, Any]) -> dict[str, Any]:
         user = await get_user_by_email(session, case["persona"])
         if user is None:
             raise RuntimeError(f"persona {case['persona']} not found; seed the database first")
+        grounding = await grounding_for(session, user)
         conv = await conversation_service.create(session, user, title=f"eval {case['id']}", is_eval=True)
         cost = 0.0
         payload: dict[str, Any] = {}
@@ -99,6 +129,7 @@ async def run_case(case: dict[str, Any]) -> dict[str, Any]:
         "tools": payload.get("tools", []),
         "cache_hit": payload.get("cache_hit", False),
         "contexts": await _sources(payload.get("trace_id")),
+        "grounding": grounding,
         "latency_ms": payload.get("latency_ms") or int((time.monotonic() - t0) * 1000),
         "cost_usd": round(cost, 6),
     }
@@ -119,6 +150,7 @@ async def execute(
     run_id: uuid.UUID | None = None,
     limit: int | None = None,
     categories: list[str] | None = None,
+    per_category: int | None = None,
     metrics: tuple[str, ...] = CORE_METRICS,
     judges: list[str] | None = None,
     use_ragas: bool = True,
@@ -134,6 +166,7 @@ async def execute(
             run_id=run_id,
             limit=limit,
             categories=categories,
+            per_category=per_category,
             metrics=metrics,
             judges=judges,
             use_ragas=use_ragas,
@@ -150,6 +183,7 @@ async def _execute(
     run_id: uuid.UUID | None,
     limit: int | None,
     categories: list[str] | None,
+    per_category: int | None,
     metrics: tuple[str, ...],
     judges: list[str] | None,
     use_ragas: bool,
@@ -157,16 +191,13 @@ async def _execute(
     triggered_by: uuid.UUID | None,
     dataset: Path,
 ) -> dict[str, Any]:
-    cases = load(dataset)
-    if categories:
-        cases = [c for c in cases if c["category"] in categories]
-    if limit:
-        cases = cases[:limit]
+    cases = select_cases(load(dataset), categories=categories, per_category=per_category, limit=limit)
     judges = judges or list(settings.eval_judges)
     config = {
         "suite": "golden",
         "cases": len(cases),
         "categories": categories,
+        "per_category": per_category,
         "metrics": list(metrics) if use_ragas else [],
         "judges": judges if use_ragas else [],
         "semantic_cache": settings.semantic_cache_enabled,
@@ -204,6 +235,7 @@ async def _execute(
                     answer=result["answer"],
                     contexts=result["contexts"],
                     reference=case.get("reference", ""),
+                    grounding=result.get("grounding", []),
                 )
             return {"case": case, "result": result, "checks": checks, "scores": scores}
 
@@ -304,6 +336,94 @@ async def _store(run_id: uuid.UUID, rows: list[dict[str, Any]], n_judges: int) -
         await session.commit()
 
 
+async def rescore(
+    source_run_id: uuid.UUID,
+    *,
+    metrics: tuple[str, ...] = CORE_METRICS,
+    judges: list[str] | None = None,
+    dataset: Path = DATASET,
+) -> dict[str, Any]:
+    """Re-judge the stored answers of an earlier run (no agent calls) into a new run."""
+    golden = {c["id"]: c for c in load(dataset)}
+    judges = judges or list(settings.eval_judges)
+    async with SessionLocal() as session:
+        source = await session.get(EvalRun, source_run_id)
+        if source is None:
+            raise ValueError(f"evaluation run {source_run_id} not found")
+        stored = (
+            (await session.execute(select(EvalResult).where(EvalResult.run_id == source_run_id)))
+            .scalars()
+            .all()
+        )
+        groundings: dict[str, list[str]] = {}
+        for r in stored:
+            if r.persona and r.persona not in groundings:
+                user = await get_user_by_email(session, r.persona)
+                groundings[r.persona] = await grounding_for(session, user) if user else [REFERENCE_FACTS]
+        config = {
+            **source.config,
+            "rescore_of": str(source_run_id),
+            "metrics": list(metrics),
+            "judges": judges,
+        }
+        run = EvalRun(suite=source.suite, status="running", config=config, started_at=utcnow())
+        session.add(run)
+        await session.commit()
+        run_id = run.id
+    jury = Jury(judges, metrics)
+
+    async def one(r: EvalResult) -> dict[str, Any]:
+        case = golden.get(r.case_id) or {
+            "id": r.case_id,
+            "category": r.category,
+            "persona": r.persona,
+            "question": r.question,
+            "reference": r.reference or "",
+            "expected_outcome": "answered",
+            "expected_tools": r.expected_tools,
+        }
+        if r.error:
+            return {"case": case, "error": r.error}
+        answered = case["expected_outcome"] != "blocked" and bool(r.checks.get("outcome"))
+        grounding = groundings.get(r.persona or "", [REFERENCE_FACTS])
+        result: dict[str, Any] = {
+            "answer": r.answer,
+            "outcome": "answered" if answered else "blocked",
+            "tools": [{"tool": t} for t in r.actual_tools],
+            "cache_hit": False,
+            "contexts": r.contexts,
+            "grounding": grounding,
+            "latency_ms": r.latency_ms or 0,
+            "cost_usd": float(r.cost_usd or 0),
+        }
+        scores = (
+            await jury.score(
+                question=r.question,
+                answer=r.answer,
+                contexts=r.contexts,
+                reference=case.get("reference", ""),
+                grounding=grounding,
+            )
+            if answered
+            else {}
+        )
+        return {"case": case, "result": result, "checks": r.checks, "scores": scores}
+
+    rows = await asyncio.gather(*(one(r) for r in stored))
+    summary = _summarize(rows, len(judges))
+    passed, thresholds, failures = _gate(summary["metrics"])
+    summary.update(thresholds=thresholds, gate_failures=failures)
+    await _store(run_id, rows, len(judges))
+    report_path = write_reports(run_id, config, summary, rows, passed)
+    async with SessionLocal() as session:
+        finished = await session.get(EvalRun, run_id)
+        assert finished is not None
+        finished.status, finished.summary, finished.passed = "completed", summary, passed
+        finished.report_path, finished.finished_at = str(report_path), utcnow()
+        await session.commit()
+    return {"run_id": str(run_id), "passed": passed, "summary": summary, "report": str(report_path)}
+
+
 def _parse_metrics(value: str) -> tuple[str, ...]:
     if value == "core":
         return CORE_METRICS
@@ -316,23 +436,27 @@ async def _main(args: argparse.Namespace) -> int:
     configure_logging()
     metrics = _parse_metrics(args.metrics)
     judges = list(settings.eval_judges)[: args.judges] if args.judges else list(settings.eval_judges)
-    cases = load()
     categories = args.categories.split(",") if args.categories else None
-    if categories:
-        cases = [c for c in cases if c["category"] in categories]
-    if args.limit:
-        cases = cases[: args.limit]
+    cases = select_cases(load(), categories=categories, per_category=args.per_category, limit=args.limit)
     estimate = estimate_cost(cases, metrics if not args.no_ragas else (), 0 if args.no_ragas else len(judges))
     print(
         f"Golden suite: {len(cases)} cases · metrics {list(metrics) if not args.no_ragas else 'none'} · "
         f"judges {judges if not args.no_ragas else 'none'} · estimated cost ≈ ${estimate:.2f}"
     )
+    if args.rescore:
+        try:
+            outcome = await rescore(uuid.UUID(args.rescore), metrics=metrics, judges=judges)
+        finally:
+            await close_redis()
+            await dispose()
+        return _print_outcome(outcome)
     if args.dry_run:
         return 0
     try:
         outcome = await execute(
             limit=args.limit,
             categories=categories,
+            per_category=args.per_category,
             metrics=metrics,
             judges=judges,
             use_ragas=not args.no_ragas,
@@ -343,6 +467,10 @@ async def _main(args: argparse.Namespace) -> int:
         sandbox.shutdown()
         await close_redis()
         await dispose()
+    return _print_outcome(outcome)
+
+
+def _print_outcome(outcome: dict[str, Any]) -> int:
     s = outcome["summary"]
     print(
         json.dumps(
@@ -360,6 +488,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the golden evaluation suite")
     parser.add_argument("--suite", default="golden", choices=["golden"])
     parser.add_argument("--limit", type=int, default=None, help="run only the first N cases")
+    parser.add_argument(
+        "--per-category", type=int, default=None, help="at most N cases per category (stratified sample)"
+    )
     parser.add_argument("--categories", default="", help="comma-separated categories to include")
     parser.add_argument("--metrics", default="core", help="core | all | comma-separated RAGAS metric names")
     parser.add_argument("--judges", type=int, default=0, help="use only the first N judges of EVAL_JUDGES")
@@ -367,6 +498,9 @@ def main() -> None:
     parser.add_argument("--with-cache", action="store_true", help="keep the semantic answer cache on")
     parser.add_argument("--concurrency", type=int, default=3)
     parser.add_argument("--dry-run", action="store_true", help="print the plan and cost estimate only")
+    parser.add_argument(
+        "--rescore", default="", help="re-judge the stored answers of this run id (no agent calls)"
+    )
     sys.exit(asyncio.run(_main(parser.parse_args())))
 
 

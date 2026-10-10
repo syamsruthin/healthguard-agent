@@ -8,7 +8,7 @@ import pytest
 from backend.evals.build_golden import money_re
 from backend.evals.checks import aggregate, case_checks
 from backend.evals.ragas_jury import Jury
-from backend.evals.run import estimate_cost, flag_disagreement
+from backend.evals.run import estimate_cost, flag_disagreement, select_cases
 
 ANSWER_CASE = {
     "expected_outcome": "answered",
@@ -117,3 +117,20 @@ async def test_jury_aggregates_and_tolerates_failing_judges() -> None:
         "judge-a": 0.8
     }
     assert "context_recall" not in scores  # needs a reference
+
+
+def test_select_cases_stratified_sample() -> None:
+    cases = [{"id": f"{cat}-{i}", "category": cat} for cat in ("a", "b", "c") for i in range(3)]
+    assert [c["id"] for c in select_cases(cases, per_category=1)] == ["a-0", "b-0", "c-0"]
+    assert [c["id"] for c in select_cases(cases, categories=["b"], limit=2)] == ["b-0", "b-1"]
+    assert len(select_cases(cases, per_category=2, limit=5)) == 5
+
+
+def test_grounding_reaches_faithfulness_only() -> None:
+    faith = Jury._inputs("faithfulness", "q", "a", ["[S1] data"], "ref", ["Member profile: x"])
+    recall = Jury._inputs("context_recall", "q", "a", ["[S1] data"], "ref", ["Member profile: x"])
+    assert faith is not None and faith["retrieved_contexts"] == ["[S1] data", "Member profile: x"]
+    assert recall is not None and recall["retrieved_contexts"] == ["[S1] data"]
+    assert (
+        Jury._inputs("faithfulness", "q", "a", [], "ref", ["g"]) is None
+    )  # nothing retrieved, nothing to judge
