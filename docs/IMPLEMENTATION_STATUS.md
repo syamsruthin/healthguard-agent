@@ -22,6 +22,7 @@ remaining phases in this order: **P0 baseline → 7 → L0 live smoke → 9 → 
 | L0 Live smoke test | ✅ Done | First run against live OpenRouter; corpus re-embedded with `openai/text-embedding-3-small`; 8/8 persona scenarios answered, grounded and complete (see below) |
 | P9 Auth + API | ✅ Done | App factory + lifespan; pure-ASGI request-id / security-header / body-size middleware; JWT auth with refresh rotation + reuse detection; conversations CRUD (soft delete + checkpoint cleanup); JSON and SSE chat; feedback; coverage card; admin metrics / traces / eval runs; Redis rate limits; arq enqueue seam. 17 API integration tests; live SSE turn verified through `uvicorn` |
 | P8 Memory | ✅ Done | Token-budgeted window + rolling summary (`summary_upto` so window and summary never overlap); long-term memories with a deterministic privacy filter (IDs, amounts, dates, contacts, clinical terms), duplicate check (cosine > 0.9), 50-per-user cap, pgvector retrieval at the minimum similarity; `/me/memories` list / delete / clear and `PATCH /me/settings`. 25 tests |
+| P10 Worker | ✅ Done | arq `WorkerSettings` with `title_conversation`, `summarize_conversation` (Redis lock), `extract_memories`, `online_eval` (jury of `ONLINE_EVAL_JUDGES`, mean + spread per metric, tolerant of a failing judge); background LLM calls persisted with no trace id. Verified live: title generated, online eval faithfulness 0.975 / relevancy 1.0 from GPT-5.4-mini + Gemini 3.8 Flash |
 
 Fixes made in P0:
 - `prefilter` member-ID check is case-insensitive (`m100004` was slipping through).
@@ -104,7 +105,7 @@ The slugs come from a web search (Oct 2026), not a live API check, because `open
 | 7 | Agent graph rewrite (LangGraph) | ✅ Done (session 2) | see §0 |
 | 8 | Memory: history window, rolling summary, long-term memories | ✅ Done (session 2) | see §0 |
 | 9 | Auth + API + semantic cache | ✅ Done (session 2) | see §0 |
-| 10 | Background worker (arq) | ⬜ Not started | — |
+| 10 | Background worker (arq) | ✅ Done (session 2) | see §0 |
 | 11 | Evaluations (RAGAS jury, online eval, golden set) | ⬜ Not started (APIs checked) | — |
 | 12 | Streamlit multipage UI | ⬜ Not started (old UI removed) | — |
 | 13 | Observability wiring, architecture diagrams, docs | ⬜ Telemetry module done; diagrams and docs not started | — |
