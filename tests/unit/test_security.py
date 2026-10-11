@@ -26,11 +26,11 @@ def test_password_hash_roundtrip() -> None:
 
 def test_access_token_roundtrip() -> None:
     uid = uuid.uuid4()
-    token, ttl = create_access_token(user_id=uid, role="member", member_id="M100001", email="a@b.c")
+    token, ttl = create_access_token(user_id=uid, role="member")
     claims = decode_access_token(token)
     assert claims["sub"] == str(uid)
-    assert claims["mid"] == "M100001"
     assert claims["role"] == "member"
+    assert not {"email", "mid"} & set(claims)  # bearer tokens carry no PII
     assert ttl == settings.access_token_ttl_minutes * 60
 
 
@@ -42,7 +42,7 @@ def test_rejects_wrong_type_and_tampering() -> None:
     )
     with pytest.raises(jwt.InvalidTokenError):
         decode_access_token(forged)
-    token, _ = create_access_token(user_id=uuid.uuid4(), role="admin", member_id=None, email="a@b.c")
+    token, _ = create_access_token(user_id=uuid.uuid4(), role="admin")
     with pytest.raises(jwt.InvalidTokenError):
         decode_access_token(token[:-2] + ("A" if token[-2] != "A" else "B") + token[-1])
 

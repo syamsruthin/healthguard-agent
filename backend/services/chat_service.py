@@ -136,6 +136,27 @@ async def release(prepared: PreparedTurn) -> None:
     await release_lock(prepared.lock_key, prepared.turn_id)
 
 
+def member_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Tool summaries without the generated SQL / pandas code (internal detail, admin-only)."""
+    return [{k: v for k, v in t.items() if k != "code"} for t in tools]
+
+
+def member_citations(citations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Citations without the code behind a data source (document snippets stay)."""
+    return [{k: v for k, v in c.items() if k != "detail"} for c in citations]
+
+
+def _member_sink(sink: EventSink) -> EventSink:
+    """Live events for a member: streamed citations lose their code detail."""
+
+    async def forward(event: dict[str, Any]) -> None:
+        if event.get("type") == "citations":
+            event = {**event, "citations": member_citations(event.get("citations", []))}
+        await sink(event)
+
+    return forward
+
+
 def _tool_summaries(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {
@@ -291,6 +312,8 @@ async def execute_turn(prepared: PreparedTurn, sink: EventSink = _noop) -> dict[
                 message=prepared.message,
                 exclude_message_id=prepared.user_message_id,
             )
+        if user.role != "admin":
+            sink = _member_sink(sink)
         state = dict(
             initial_state(
                 turn_id=prepared.turn_id,
@@ -327,6 +350,11 @@ async def execute_turn(prepared: PreparedTurn, sink: EventSink = _noop) -> dict[
 
     latency_ms = int((time.monotonic() - prepared.started) * 1000)
     assistant_id = await _persist(prepared, final, collector, trace_id=trace_id, latency_ms=latency_ms)
+    # Admins get the full trace and generated code; members get the plan, steps and verdict
+    # (everything is persisted either way and readable by admins via /admin/traces).
+    admin = user is not None and user.role == "admin"
+    tools = _tool_summaries(final.get("results", []))
+    citations = final.get("citations", [])
     payload = {
         "message_id": str(assistant_id),
         "conversation_id": str(prepared.conversation_id),
@@ -335,13 +363,14 @@ async def execute_turn(prepared: PreparedTurn, sink: EventSink = _noop) -> dict[
         "fallback": final.get("fallback") or None,
         "cache_hit": bool(final.get("cache_hit")),
         "standalone_query": final.get("standalone_query", ""),
-        "tools": _tool_summaries(final.get("results", [])),
-        "citations": final.get("citations", []),
+        "plan": final.get("plan", []),
+        "tools": tools if admin else member_tools(tools),
+        "citations": citations if admin else member_citations(citations),
         "verification": final.get("verification") or None,
         "latency_ms": latency_ms,
         "usage": collector.totals,
         "trace_id": str(trace_id),
-        "trace": final.get("trace", []),
+        "trace": final.get("trace", []) if admin else [],
     }
     await sink({"type": "final", **payload})
     TURN_LATENCY.observe(latency_ms / 1000)

@@ -62,7 +62,12 @@ async def list_messages(
     session: AsyncSession = Depends(get_session),
 ) -> list[MessageOut]:
     conv = await conversation_service.get_owned(session, user, conversation_id)
-    return [MessageOut.model_validate(m) for m in await conversation_service.messages(session, conv)]
+    out = [MessageOut.model_validate(m) for m in await conversation_service.messages(session, conv)]
+    if user.role != "admin":  # generated SQL / pandas code is an internal detail
+        for m in out:
+            m.tools = chat_service.member_tools(m.tools)
+            m.citations = chat_service.member_citations(m.citations)
+    return out
 
 
 @router.post("/{conversation_id}/messages", dependencies=[Depends(chat_rate_limit)])

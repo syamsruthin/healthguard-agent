@@ -55,9 +55,10 @@ async def test_streamed_turn_contract_and_persistence(client, fake_llm, jobs) ->
     assert final["outcome"] == "answered" and final["conversation_id"] == cid
     tool = final["tools"][0]
     assert tool["tool"] == "sql" and tool["ok"] and tool["row_count"] >= 1
-    # Row-Level Security: the generated SQL had no member filter, yet only Maria's claims came back.
-    sql_step = next(s for s in final["trace"] if s["node"] == "execute")
-    assert sql_step["output"][0]["ok"]
+    # Members get the plan, steps and verdict, not the trace or the generated SQL.
+    assert final["trace"] == [] and final["plan"][0]["tool"] == "sql" and "code" not in tool
+    streamed = next(e for e in events if e["type"] == "citations")["citations"]
+    assert streamed and not any("detail" in c for c in streamed + final["citations"])
 
     async with SessionLocal() as session:
         msgs = (
@@ -70,6 +71,9 @@ async def test_streamed_turn_contract_and_persistence(client, fake_llm, jobs) ->
         assert str(assistant.id) == final["message_id"] and assistant.meta["outcome"] == "answered"
         trace = await session.get(Trace, assistant.trace_id)
         assert trace is not None and [s["node"] for s in trace.steps][-1] == "finalize"
+        # Row-Level Security: the generated SQL had no member filter, yet the query ran for Maria only.
+        sql_step = next(s for s in trace.steps if s["node"] == "execute")
+        assert sql_step["output"][0]["ok"] and assistant.tools[0]["code"] == DENIED_CLAIMS_SQL
         calls = (
             await session.execute(
                 select(func.count()).select_from(LLMCall).where(LLMCall.trace_id == assistant.trace_id)
@@ -305,3 +309,28 @@ async def test_turn_deadline_returns_a_fallback_and_frees_the_conversation(
     final = events[-1]
     assert final["type"] == "final" and final["outcome"] == "error" and final["fallback"] == "timeout"
     assert not await get_redis().exists(f"hg:turn:{cid}")
+
+
+async def test_admins_get_the_full_trace_and_generated_code(client, fake_llm) -> None:
+    fake_llm(script())
+    member = await login(client, "maria.garcia@demo.healthguard.dev")
+    cid = await _conversation(client, member)
+    await client.post(
+        f"{API}/conversations/{cid}/messages",
+        json={"message": "Why was my claim denied?"},
+        headers=auth(member),
+    )
+    history = (await client.get(f"{API}/conversations/{cid}/messages", headers=auth(member))).json()
+    assert "code" not in history[-1]["tools"][0] and "detail" not in history[-1]["citations"][0]
+
+    admin = await login(client, "admin@demo.healthguard.dev")
+    admin_cid = await _conversation(client, admin)
+    final = (
+        await client.post(
+            f"{API}/conversations/{admin_cid}/messages",
+            json={"message": "Which claims were denied?"},
+            headers=auth(admin),
+        )
+    ).json()
+    assert final["trace"] and final["tools"][0]["code"] == DENIED_CLAIMS_SQL
+    assert final["citations"][0]["detail"] == DENIED_CLAIMS_SQL

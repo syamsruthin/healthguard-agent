@@ -32,16 +32,13 @@ def verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
-def create_access_token(
-    *, user_id: uuid.UUID, role: str, member_id: str | None, email: str
-) -> tuple[str, int]:
+def create_access_token(*, user_id: uuid.UUID, role: str) -> tuple[str, int]:
+    """Short-lived bearer token. It carries no PII: the server loads the user (and member link) by `sub`."""
     now = datetime.now(UTC)
     ttl = timedelta(minutes=settings.access_token_ttl_minutes)
     payload: dict[str, Any] = {
         "sub": str(user_id),
         "role": role,
-        "mid": member_id,
-        "email": email,
         "iss": settings.jwt_issuer,
         "iat": int(now.timestamp()),
         "exp": int((now + ttl).timestamp()),

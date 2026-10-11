@@ -69,9 +69,7 @@ async def register(session: AsyncSession, *, email: str, password: str, full_nam
 async def _issue(
     session: AsyncSession, user: User, family_id: uuid.UUID | None = None
 ) -> tuple[TokenPair, RefreshToken]:
-    access, ttl = create_access_token(
-        user_id=user.id, role=user.role, member_id=user.member_id, email=user.email
-    )
+    access, ttl = create_access_token(user_id=user.id, role=user.role)
     raw, digest = new_refresh_token()
     token = RefreshToken(
         user_id=user.id,

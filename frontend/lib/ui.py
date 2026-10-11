@@ -67,7 +67,7 @@ def citations(items: list[dict[str, Any]]) -> None:
 
 
 def reasoning(meta: dict[str, Any], trace: list[dict[str, Any]] | None = None) -> None:
-    """Plan, tool steps and verification for one answer (plus the full trace for admins)."""
+    """Plan, tool steps and verification for one answer (plus the full trace, which the API sends to admins only)."""
     with st.expander("How this answer was produced", icon=":material/account_tree:"):
         plan = meta.get("plan") or []
         if plan:

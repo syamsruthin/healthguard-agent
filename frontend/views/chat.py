@@ -179,14 +179,7 @@ def _stream_turn(api: Any, prompt: str) -> None:
                     "outcome": final.get("outcome"),
                     "verification": final.get("verification"),
                     "usage": final.get("usage"),
-                    "plan": next(
-                        (
-                            s["output"].get("plan", [])
-                            for s in reversed(final.get("trace", []))
-                            if s["node"] == "understand" and isinstance(s.get("output"), dict)
-                        ),
-                        [],
-                    ),
+                    "plan": final.get("plan", []),
                 },
             }
         )
