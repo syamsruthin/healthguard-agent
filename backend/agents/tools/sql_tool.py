@@ -1,27 +1,22 @@
 """
 `sql` tool — NL task → validated SQL → read-only, RLS-scoped execution,
-with a self-correction loop that feeds guard/DB errors back to the model.
+with the shared self-correction loop (`codegen.py`) feeding guard / database
+errors back to the model.
 """
 
 from __future__ import annotations
 
-import time
 from typing import Any
 
 from tabulate import tabulate
 
 from backend.agents.tools.base import MEMBER_ID_RE, ToolResult, UserContext, jsonable
+from backend.agents.tools.codegen import CodegenTool, Execution, run_codegen
 from backend.agents.tools.sql_guard import SQLGuardError, validate_sql
 from backend.core.config import settings
-from backend.core.logging import get_logger
-from backend.core.telemetry import TOOL_EVENTS
 from backend.db.session import get_agent_pool
-from backend.llm import cache as llm_cache
-from backend.llm.client import LLMError, get_llm, strip_fences
 from backend.llm.prompts.sql import build_sql_messages
-from backend.llm.registry import Role
 
-log = get_logger(__name__)
 _DISPLAY_ROWS = 50
 
 
@@ -52,64 +47,24 @@ async def execute_scoped(sql: str, user: UserContext, *params: Any) -> tuple[lis
     return rows, truncated
 
 
+def _describe_failure(exc: Exception, sql: str) -> tuple[str, str, str]:
+    if isinstance(exc, SQLGuardError):
+        return f"Rejected by the SQL safety guard: {exc}. SQL was:\n{sql}", "guard_rejected", "guard_rejected"
+    first_line = (str(exc).splitlines() or [exc.__class__.__name__])[0][:300]
+    return f"Database error: {first_line}. SQL was:\n{sql}", "db_error", "db_error"
+
+
 async def run_sql_tool(step_id: str, task: str, user: UserContext, prior: str = "") -> ToolResult:
-    t0 = time.monotonic()
-    llm = get_llm()
-    error = ""
-    error_code = ""
-    sql = ""
-    attempts = 0
-    for attempt in range(settings.max_tool_retries + 1):
-        attempts = attempt + 1
-        gen = None
-        try:
-            gen = await llm.complete(
-                Role.CODE,
-                build_sql_messages(task=task, member_context=user.tool_context(), prior=prior, error=error),
-                name="sql" if attempt == 0 else f"sql.retry{attempt}",
-                use_cache=attempt == 0,
-            )
-            sql = strip_fences(gen.text)
-            safe = validate_sql(sql, max_rows=settings.sql_max_rows)
-            rows, truncated = await execute_scoped(safe, user)
-            TOOL_EVENTS.labels(tool="sql", outcome="ok" if attempt == 0 else "ok_after_retry").inc()
-            return ToolResult(
-                step_id=step_id,
-                tool="sql",
-                task=task,
-                ok=True,
-                code=sql,
-                data=rows,
-                row_count=len(rows),
-                truncated=truncated,
-                formatted=format_rows(rows, len(rows), truncated),
-                attempts=attempts,
-                duration_ms=int((time.monotonic() - t0) * 1000),
-            )
-        except SQLGuardError as exc:
-            error, error_code = f"Rejected by the SQL safety guard: {exc}. SQL was:\n{sql}", "guard_rejected"
-            TOOL_EVENTS.labels(tool="sql", outcome="guard_rejected").inc()
-        except LLMError as exc:
-            error, error_code = str(exc), "llm_unavailable"
-            TOOL_EVENTS.labels(tool="sql", outcome="llm_unavailable").inc()
-            break
-        except Exception as exc:  # database errors
-            error, error_code = (
-                f"Database error: {str(exc).splitlines()[0][:300]}. SQL was:\n{sql}",
-                "db_error",
-            )
-            TOOL_EVENTS.labels(tool="sql", outcome="db_error").inc()
-        if gen is not None:
-            await llm_cache.forget(gen.cache_key)  # a rejected first attempt must not be replayed
-        log.info("sql_tool_retry", step=step_id, attempt=attempts, error=error[:200])
-    return ToolResult(
-        step_id=step_id,
-        tool="sql",
-        task=task,
-        ok=False,
-        code=sql,
-        error=error,
-        error_code=error_code,
-        attempts=attempts,
-        duration_ms=int((time.monotonic() - t0) * 1000),
+    async def execute(sql: str) -> Execution:
+        rows, truncated = await execute_scoped(validate_sql(sql, max_rows=settings.sql_max_rows), user)
+        return Execution(rows, format_rows(rows, len(rows), truncated), len(rows), truncated)
+
+    tool = CodegenTool(
+        name="sql",
+        build_messages=lambda error: build_sql_messages(
+            task=task, member_context=user.tool_context(), prior=prior, error=error
+        ),
+        execute=execute,
+        describe_failure=_describe_failure,
     )
+    return await run_codegen(tool, step_id=step_id, task=task)

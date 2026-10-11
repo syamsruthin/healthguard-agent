@@ -31,6 +31,7 @@ import yaml
 from sqlalchemy import select
 
 from backend.agents.tools import sandbox
+from backend.agents.trace import synthesis_sources
 from backend.core.config import settings
 from backend.core.logging import configure_logging, get_logger
 from backend.core.redis import close_redis
@@ -97,15 +98,13 @@ def estimate_cost(cases: list[dict[str, Any]], metrics: tuple[str, ...], judges:
 
 
 async def _sources(trace_id: str | None) -> list[str]:
+    """The turn's sources, one context per [S#] / [D#] block."""
     if not trace_id:
         return []
     async with SessionLocal() as session:
         trace = await session.get(Trace, uuid.UUID(trace_id))
-    for step in reversed(trace.steps if trace else []):
-        if step.get("node") == "synthesize":
-            text = step.get("metadata", {}).get("sources", "")
-            return [s.strip() for s in _SOURCE_SPLIT.split(text) if s.strip()]
-    return []
+    text = synthesis_sources(trace.steps if trace else [])
+    return [s.strip() for s in _SOURCE_SPLIT.split(text) if s.strip()]
 
 
 async def grounding_for(session: Any, user: Any) -> list[str]:

@@ -14,6 +14,7 @@ from typing import Any
 from sqlalchemy import exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.agents.trace import synthesis_sources
 from backend.core.config import settings
 from backend.core.logging import get_logger
 from backend.db.models import Message, OnlineEvalScore, Trace
@@ -43,10 +44,7 @@ async def _turn_inputs(session: AsyncSession, message: Message) -> tuple[str, st
     sources = ""
     if message.trace_id is not None:
         trace = await session.get(Trace, message.trace_id)
-        for step in reversed(trace.steps if trace else []):
-            if step.get("node") == "synthesize":
-                sources = step.get("metadata", {}).get("sources", "")
-                break
+        sources = synthesis_sources(trace.steps if trace else [])
     return question, sources
 
 

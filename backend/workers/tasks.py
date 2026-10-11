@@ -8,14 +8,13 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Awaitable, Callable
-from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import select
 
 from backend.core.logging import get_logger
 from backend.core.redis import get_redis
-from backend.db.models import Conversation, LLMCall, Message, User
+from backend.db.models import Conversation, Message, User
 from backend.db.session import SessionLocal
 from backend.evals.online import score_message
 from backend.llm.client import get_llm
@@ -25,6 +24,7 @@ from backend.llm.registry import Role
 from backend.llm.usage import UsageCollector, start_collection, stop_collection
 from backend.memory import long_term
 from backend.memory.summarizer import maybe_summarize
+from backend.services.llm_calls import llm_call_rows
 
 log = get_logger(__name__)
 DEFAULT_TITLE = "New conversation"
@@ -34,23 +34,7 @@ async def _persist_calls(collector: UsageCollector) -> None:
     if not collector.calls:
         return
     async with SessionLocal() as session:
-        session.add_all(
-            LLMCall(
-                trace_id=None,
-                role=c.role,
-                name=c.name[:64],
-                model=c.model[:128],
-                prompt_tokens=c.prompt_tokens,
-                completion_tokens=c.completion_tokens,
-                cached_tokens=c.cached_tokens,
-                cache_write_tokens=c.cache_write_tokens,
-                cost_usd=Decimal(str(c.cost_usd)),
-                latency_ms=c.latency_ms,
-                exact_cache_hit=c.exact_cache_hit,
-                error=c.error,
-            )
-            for c in collector.calls
-        )
+        session.add_all(llm_call_rows(collector.calls, trace_id=None))
         await session.commit()
 
 

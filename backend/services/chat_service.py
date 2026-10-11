@@ -42,12 +42,13 @@ from backend.core.logging import get_logger
 from backend.core.redis import get_redis
 from backend.core.telemetry import TURN_LATENCY
 from backend.db.base import utcnow
-from backend.db.models import Conversation, LLMCall, Message, Trace, User
+from backend.db.models import Conversation, Message, Trace, User
 from backend.db.session import SessionLocal, get_data_version
 from backend.llm.usage import UsageCollector, start_collection, stop_collection
 from backend.memory import long_term
 from backend.memory.context import MemoryContext, build_context
 from backend.services import conversation_service
+from backend.services.llm_calls import llm_call_rows
 from backend.services.user_context import load_user_context
 from backend.workers.queue import get_enqueuer
 
@@ -224,23 +225,7 @@ async def _persist(
                 total_ms=latency_ms,
             )
         )
-        session.add_all(
-            LLMCall(
-                trace_id=trace_id,
-                role=c.role,
-                name=c.name[:64],
-                model=c.model[:128],
-                prompt_tokens=c.prompt_tokens,
-                completion_tokens=c.completion_tokens,
-                cached_tokens=c.cached_tokens,
-                cache_write_tokens=c.cache_write_tokens,
-                cost_usd=Decimal(str(c.cost_usd)),
-                latency_ms=c.latency_ms,
-                exact_cache_hit=c.exact_cache_hit,
-                error=c.error,
-            )
-            for c in collector.calls
-        )
+        session.add_all(llm_call_rows(collector.calls, trace_id))
         conversation = await session.get(Conversation, prepared.conversation_id)
         if conversation is not None:
             conversation.updated_at = utcnow()

@@ -77,3 +77,11 @@ def traced(node: str, status: str) -> Callable[[NodeFn], NodeFn]:
 
 def append(state: AgentState, *steps: dict[str, Any]) -> list[dict[str, Any]]:
     return [*state.get("trace", []), *steps]
+
+
+def synthesis_sources(steps: list[dict[str, Any]]) -> str:
+    """The labelled sources the final answer was written from (the last synthesis step's)."""
+    for s in reversed(steps):
+        if s.get("node") == "synthesize":
+            return str(s.get("metadata", {}).get("sources", ""))
+    return ""
