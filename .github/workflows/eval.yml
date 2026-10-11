@@ -1,6 +1,6 @@
 name: Offline evaluation (RAGAS + judge ensemble)
 
-# Manual only: every run spends OpenRouter credit (≈ $0.04 per case with the 3-judge jury);
+# Manual only: every run spends OpenRouter credit (≈ $0.03 per case with the 3-judge jury on the router default);
 # `hg-eval --dry-run --limit N` prints the estimate.
 on:
   workflow_dispatch:

@@ -7,7 +7,7 @@ HealthGuard is an AI assistant for members of a (synthetic) US health insurer. I
 3. **writes an answer** in which every fact cites its source, and
 4. **verifies** that answer before the member sees it.
 
-Every turn streams live to the browser. It is stored with a full trace and its exact cost, and it can never expose another member's data.
+Every turn streams live to the browser. It is stored with a full trace and its exact cost, and it can never expose another member's data. Repeated questions are answered from a verified cache without calling a model, and spend guards keep the bill predictable.
 
 ```text
 Member (Maria): Why was my knee MRI in April denied, and how can I appeal it?
@@ -20,7 +20,7 @@ HealthGuard:   Your April 6, 2026 knee MRI at Austin Imaging Center (claim CLM-2
                your EOB [D2] — in the member portal, by mail, or by phone at 1-800-442-7732 [D2] …
                ───────────────────────────────────────────────────────────────────────────────
                Plan: s1 sql (denied knee MRI claim + denial code) ∥ s2 policy_search (appeals, D002)
-               Verified: grounded ✓ complete ✓  ·  ≈ 20 s  ·  $0.023 (10,391 prompt tokens served from cache)
+               Verified: grounded ✓ complete ✓  ·  $0.009–0.017 per turn on the default Jev Router
 ```
 
 > All member data in this project is synthetic and generated deterministically. The demo personas are fictional.
@@ -55,7 +55,8 @@ HealthGuard:   Your April 6, 2026 knee MRI at Austin Imaging Center (claim CLM-2
 ## Features
 
 **Agent**
-- LangGraph graph with these nodes: understand → semantic cache → execute → synthesize → verify, plus replan and rewrite.
+- LangGraph graph with these nodes: cache-first lookup → understand → (follow-up cache lookup) → execute → synthesize → verify, plus replan and rewrite.
+- An opening question that was already answered (and verified) is served from the semantic cache **before any model call**.
 - One fast call does four jobs: classifies scope and safety, resolves references ("that plan", "it"), rewrites the question so it stands alone, and produces a plan of dependent steps.
 - Independent steps run in parallel. Dependent steps receive their prerequisites' output.
 - Each tool retries itself: SQL and pandas errors are sent back to the model so it can fix the code.
@@ -77,11 +78,13 @@ HealthGuard:   Your April 6, 2026 knee MRI at Austin Imaging Center (claim CLM-2
 - Conversations with history, titles and soft delete.
 - Streaming answers over Server-Sent Events (SSE), with live plan and tool progress.
 - Citations, feedback (👍/👎), a coverage card, and memory controls.
+- "Show how answers are produced": members see the plan, steps and verification verdict; admins also see the full trace and the generated SQL / pandas code.
 - A multipage Streamlit UI with admin dashboards for observability and evaluations.
 - A background worker (arq) for titles, rolling summaries, long-term memories and online answer scoring.
 
 **Cost and quality**
 - Per-role models through OpenRouter, defaulting to the cost-optimising Jev Router with fixed-model fallbacks.
+- Spend guards: a per-member daily turn cap, background model calls only when they have work to do, 5 % online-eval sampling, one paid evaluation run at a time, and judge spend reported per run.
 - Four cache layers:
   - provider prompt caching,
   - a user-scoped semantic answer cache,
@@ -89,7 +92,7 @@ HealthGuard:   Your April 6, 2026 knee MRI at Austin Imaging Center (claim CLM-2
   - an embedding cache.
 - Golden evaluation set built from the database.
 - `hg-eval` combines deterministic checks with a **RAGAS judge jury** (GPT, Gemini and Claude), a quality gate and reports.
-- Over 200 automated tests, a live persona suite, and CI with a coverage gate.
+- About 250 automated tests, a live persona suite, and CI with a coverage gate.
 
 ---
 
@@ -113,10 +116,14 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    S((start)) --> U["understand<br/>prefilter + scope/safety + rewrite + plan"]
+    S((start)) -- "opening question" --> CF{"cache_first<br/>no model call"}
+    S -- "follow-up" --> U
+    CF -- hit --> F
+    CF -- miss --> U["understand<br/>prefilter + scope/safety + rewrite + plan"]
     U -- "blocked" --> F
     U -- "small talk" --> SY
-    U -- "plan" --> C{"semantic cache"}
+    U -- "plan (opening question)" --> X
+    U -- "plan (follow-up)" --> C{"cache_lookup<br/>on the rewrite"}
     C -- hit --> F
     C -- miss --> X["execute<br/>parallel dependency levels"]
     X --> SY["synthesize<br/>streamed, cited"]
@@ -135,20 +142,21 @@ flowchart TD
 1. **API.** The request is authenticated (JWT) and rate-limited, and conversation ownership is checked.
    - A per-conversation lock blocks concurrent turns.
    - The user message is stored before anything else happens.
-2. **Turn task.** A background task runs the turn and feeds an event queue that the SSE response streams. If the browser disconnects, the answer is still saved.
+2. **Turn task.** A background task runs the turn and feeds an event queue that the SSE response streams. If the browser disconnects, the answer is still saved. A turn is bounded by `TURN_TIMEOUT_SECONDS`.
 3. **Context.** The task loads the member profile and dependents, the recent conversation turns (within a token budget), the rolling summary, and relevant long-term preferences.
-4. **`understand`.**
+4. **`cache_first`** (opening questions only). The question is self-contained, so its normalised text is looked up in the semantic cache before any model call: the member's own answers first, then public ones. A hit ends the turn here.
+5. **`understand`.**
    - A deterministic prefilter blocks prompt-injection patterns and other members' IDs without calling a model.
    - One structured call to the fast model decides scope and safety, rewrites the question, and plans up to four tool steps.
    - `planning.sanitize_plan` repairs whatever the model returns.
-5. **`cache_lookup`.** Checks for a verified answer to the same question within the caller's scope.
+   - For a follow-up, **`cache_lookup`** then checks the cache on the standalone rewrite.
 6. **`execute`.** Runs the plan level by level; steps within a level run concurrently.
 7. **`synthesize`.** Streams the answer token by token, citing `[S#]` for data and `[D#]` for documents.
 8. **`verify`.** Decides whether the answer is grounded and complete, then routes it to a rewrite, a replan or `finalize`.
-9. **Persistence.** The assistant message, the trace (every node's input, output, reasoning and timing) and every LLM call (tokens, cached tokens, cost) are saved in one transaction.
+9. **Persistence.** The assistant message, the trace (every node's input, output, reasoning and timing) and every LLM call (tokens, cached tokens, cost) are saved in one transaction. Members receive the plan, steps and verdict; admins also receive the full trace.
 10. **Follow-ups.**
     - Eligible answers are stored in the semantic cache.
-    - Worker jobs are queued: title, summary, memory extraction, and a sampled online evaluation.
+    - Worker jobs are queued only when they have work: a title on the first turn, a summary when history overflows the window, memory extraction when the user states a preference, and online evaluation for a 5 % sample.
 
 ---
 
@@ -177,7 +185,7 @@ flowchart TD
 
 - **Docker** (Docker Desktop on macOS or Windows), for Postgres and Redis.
 - **uv ≥ 0.8.** Check with `uv --version`. Older versions (for example the one bundled with some Anaconda installs) rewrite `uv.lock`.
-- **An OpenRouter API key** with a little credit. A typical question costs $0.01–0.04. Unit and integration tests make no model calls.
+- **An OpenRouter API key** with a little credit. A typical question costs about $0.01–0.02 on the default Jev Router; a repeated opening question is free. Unit and integration tests make no model calls.
 
 ### Option A: local development
 
@@ -323,8 +331,8 @@ Errors share one shape: `{"error": {"code", "message", "request_id"}}`. Every re
 | `answer_reset` | The answer is being regenerated (`reason`: `replan` or `revision`) |
 | `answer_replaced` | `answer`, `reason`: the final text replaces what was streamed |
 | `citations` | `citations[{tag, kind, title, …}]` |
-| `error` | `code`, `message`, `retryable` (always followed by `final`) |
-| `final` | `message_id`, `answer`, `outcome`, `fallback`, `cache_hit`, `tools`, `citations`, `verification`, `latency_ms`, `usage`, `trace_id`, `trace` |
+| `error` | `code` (`turn_failed`, `turn_timeout`, …), `message`, `retryable` (always followed by `final`) |
+| `final` | `message_id`, `answer`, `outcome`, `fallback`, `cache_hit`, `plan`, `tools`, `citations`, `verification`, `latency_ms`, `usage`, `trace_id`, `trace` (full trace and generated code for admins only; members get an empty `trace` and no code) |
 
 ```bash
 B=http://localhost:8000/api/v1
@@ -362,7 +370,8 @@ Settings are read from environment variables (or `.env`) by `backend/core/config
 | `JWT_SECRET` | dev placeholder (must be changed in production) |
 | `ACCESS_TOKEN_TTL_MINUTES` / `REFRESH_TOKEN_TTL_DAYS` | `15` / `7` |
 | `DEMO_PASSWORD` | `HealthGuard!2026` (seeded demo personas only) |
-| `RATE_LIMIT_CHAT_PER_MINUTE` / `RATE_LIMIT_AUTH_PER_MINUTE` | `20` / `10` |
+| `RATE_LIMIT_CHAT_PER_MINUTE` / `RATE_LIMIT_AUTH_PER_MINUTE` / `RATE_LIMIT_FEEDBACK_PER_MINUTE` | `20` / `10` / `30` |
+| `DAILY_TURN_LIMIT` | `150` turns per member per UTC day (`0` = unlimited; admins exempt) |
 
 **Models (OpenRouter)**
 
@@ -374,7 +383,7 @@ Settings are read from environment variables (or `.env`) by `backend/core/config
 | `MODEL_CODE` (+ `_FALLBACKS`) | `typesafe/jev-router` (fallbacks: Claude Sonnet 5.5, GPT-5.4 mini) | SQL and pandas generation |
 | `MODEL_SYNTH` (+ `_FALLBACKS`) | `typesafe/jev-router` (fallbacks: Claude Sonnet 5.5, Gemini 3.8 Flash) | The streamed answer |
 | `EVAL_JUDGES` | `openai/gpt-5.4-mini, google/gemini-3.8-flash, anthropic/claude-haiku-5.5` | Offline RAGAS jury |
-| `ONLINE_EVAL_JUDGES` / `ONLINE_EVAL_SAMPLE_RATE` | GPT + Gemini / `0.25` | Live answer scoring |
+| `ONLINE_EVAL_JUDGES` / `ONLINE_EVAL_SAMPLE_RATE` | GPT + Gemini / `0.05` | Live answer scoring (every thumbs-down is judged too; each answer at most once) |
 | `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `openrouter` / `openai/text-embedding-3-small` / `1536` | `local` uses sentence-transformers (`uv sync --extra local-embeddings`); `hash` is for tests only |
 
 `typesafe/jev-router` is TypeSafe's Jev Router on OpenRouter. It picks the model and reasoning effort for each request and bills at the price of the model that serves it, which makes it the cost-efficient default. Router-served calls get a 4,096-token output budget, because the reasoning tokens it may spend count against `max_tokens`. A structured-output repair goes to the first fixed fallback model. The judge juries stay on fixed models from different families, since a router could send every judge to the same model.
@@ -387,6 +396,7 @@ Settings are read from environment variables (or `.env`) by `backend/core/config
 | `MAX_TOOL_RETRIES` | `2` | Self-correction attempts for SQL and pandas |
 | `MAX_REPLANS` / `MAX_REVISIONS` | `1` / `1` | Extra planning rounds / rewrites without unsupported claims |
 | `VERIFY_REPLACE_UNGROUNDED` | `true` | Replace answers that still fail verification after a rewrite (`false` keeps them and only logs the verdict) |
+| `TURN_TIMEOUT_SECONDS` | `150` | Wall clock for a whole turn; the conversation lock lives 30 s longer |
 | `TOOL_STEP_TIMEOUT_SECONDS` / `SANDBOX_TIMEOUT_SECONDS` / `SQL_STATEMENT_TIMEOUT_MS` | `90` / `10` / `5000` | Limits |
 | `SQL_MAX_ROWS` / `RAG_TOP_K` / `RAG_RERANK` | `200` / `6` / `false` | Result sizes; optional LLM re-ranking of passages |
 | `MAX_INPUT_CHARS` | `2000` | Longest accepted question |
@@ -427,16 +437,18 @@ Reference data, the claims engine, plan benefits and the documents share one sou
 
 Defence in depth, from the request down to the data:
 
-1. **Authentication.** argon2id passwords. Short-lived JWT access tokens. Refresh tokens are stored only as SHA-256 hashes and rotate in families; reusing one revokes the family. Login takes the same time whether or not the account exists.
-2. **Request controls.** Rate limits per IP (auth) and per user (chat), a 64 KB body cap, security headers and a CORS allow-list. Conversation ownership is checked, and other users get **404**, never 403.
+1. **Authentication.** argon2id passwords. Short-lived JWT access tokens that carry no PII (user id and role only). Refresh tokens are stored only as SHA-256 hashes and rotate in families; reusing one revokes the family. Login takes the same time whether or not the account exists.
+2. **Request controls.** Rate limits per IP (auth) and per user (chat, feedback), a daily turn cap per member, a 64 KB body cap, security headers and a CORS allow-list. Conversation ownership is checked, and other users get **404**, never 403. Each conversation runs one turn at a time under a lock owned by that turn.
 3. **Input guardrails.** A deterministic prefilter catches injection patterns and IDs of members other than the user or their dependents. The planner then classifies scope and safety: out of scope, prompt injection, other members' data, medical advice, or self-harm (which gets crisis resources).
 4. **SQL.** The **sqlglot guard** allows one SELECT/CTE only, over `insurance` tables only, with a function allow-list and no `INTO`, `COPY`, `SET`, DML or DDL. Queries run as the **`hg_agent_ro`** role inside a **READ ONLY** transaction with a statement timeout; `set_config` is revoked. **Row-Level Security** then limits rows to the member (a subscriber also sees dependents; a spouse who is not the subscriber sees only their own). Admins see all rows; accounts with no member record see no member rows.
 5. **pandas sandbox.** AST validation (no imports, dunders, I/O or `eval`/`query`/`getattr`), restricted builtins, separate spawned processes with a wall-clock limit, and an address-space limit on Linux.
 6. **Output guardrails.** Answers are verified for groundedness and completeness, and every factual sentence carries a citation.
 7. **Data minimisation.**
    - Long-term memory stores only non-clinical preferences; a deterministic filter rejects IDs, amounts, dates, contact details and clinical terms.
-   - Logs mask emails, phone numbers, SSNs and dates.
+   - Logs mask emails, phone numbers, SSNs, dates and member IDs, including values nested in lists and objects.
+   - Members never receive the generated SQL / pandas code or the full trace; admins read them through `/admin/traces`.
    - Self-registered accounts are never linked to member records.
+8. **Operations.** `/metrics` (Prometheus) is unauthenticated: keep it on an internal network or block it at the proxy.
 
 ---
 
@@ -445,9 +457,11 @@ Defence in depth, from the request down to the data:
 | Layer | What it saves | Safety |
 |---|---|---|
 | **Provider prompt cache** | Large stable prompt prefixes: planner ≈ 4.9k tokens, SQL ≈ 5.8k, plus the synthesis and verifier prefixes | Per provider. Anthropic and Gemini get explicit `cache_control` breakpoints; OpenAI-family models cache automatically |
-| **Semantic answer cache** (Redis vector index) | Whole verified answers to repeated questions | Scoped `public` / `member:{id}` / `role:admin`. A personalised answer is never stored as public. Entries are tagged with the data version and prompt version |
-| **Exact LLM cache** | Byte-identical temperature-0 calls | Keyed on model, messages and prompt version |
-| **Embedding cache** | Query embeddings (7 days) | — |
+| **Semantic answer cache** (Redis vector index) | Whole verified answers to repeated questions. Opening questions are looked up before any model call; follow-ups after planning, on the rewrite | Scoped `public` / `member:{id}` / `role:admin`. A personalised answer is never stored as public. Entries are tagged with the data version and prompt version |
+| **Exact LLM cache** | Byte-identical temperature-0 calls | Keyed on model, messages and prompt version. Outputs that fail validation (bad JSON, rejected SQL or pandas) are dropped, so they are never replayed |
+| **Embedding cache** | Query embeddings (7 days); the cache key and memory search share one embedding | — |
+
+Background work is gated too: memory extraction runs only when the user states a preference, the summary job only when history overflows the window, online judging for 5 % of answers (each at most once), and members are capped at `DAILY_TURN_LIMIT` turns a day.
 
 Measured on the live demo. The first five rows used fixed Claude models; the last row is the Jev Router default:
 
@@ -456,7 +470,7 @@ Measured on the live demo. The first five rows used fixed Claude models; the las
 | Prompt tokens served from the provider cache | 54–60 % for the planner and SQL calls |
 | Cost of a repeated turn | 40 % lower ($0.038 → $0.023) |
 | Typical turn | $0.01–0.04; about 10 s average, 27 s p95 |
-| A second member asking a general question already in the semantic cache | $0.0002 instead of about $0.01 |
+| A second member asking a general question already in the semantic cache | $0.0002 instead of about $0.01 (measured when planning ran first; an opening question now hits before any model call) |
 | An out-of-scope question | blocked for $0.0002 |
 | The same MRI-denial turn on the Jev Router default | $0.009–0.017, vs $0.023–0.039 on fixed Claude models; the router picked DeepSeek V4.1 Flash and Gemini 3.8 Flash |
 
@@ -468,7 +482,7 @@ Measured on the live demo. The first five rows used fixed Claude models; the las
 |---|---|
 | **Conversation window** | Recent turns that fit `HISTORY_TOKEN_BUDGET`. Long assistant replies are truncated, and the current message is never duplicated. |
 | **Rolling summary** | When turns outside the window exceed `SUMMARY_TRIGGER_TOKENS`, the worker folds them into `conversations.summary`. `summary_upto` ensures the window and the summary never overlap. |
-| **Long-term memories** | Durable preferences (language, location, provider preferences, plan interests, communication style). Extracted by the fast model after a turn, filtered deterministically, de-duplicated (cosine > 0.9) and capped at 50 per user. Retrieved by similarity. Users control them on the **Memory** page or via `/me/memories`. |
+| **Long-term memories** | Durable preferences (language, location, provider preferences, plan interests, communication style). Extracted by the fast model after a turn in which the user states a preference (a cheap keyword gate skips the call otherwise), filtered deterministically, de-duplicated (cosine > 0.9) and capped at 50 per user. Retrieved by similarity; users with no memories skip the lookup. Users control them on the **Memory** page or via `/me/memories`. |
 
 ---
 
@@ -501,13 +515,14 @@ What the suites cover:
   - chunking, rank fusion, prompt-cache markers and usage accounting;
   - JWT handling, guardrails, plan sanitising and semantic-cache scoping;
   - the real OpenRouter client over a mocked HTTP transport;
-  - graph flows: routing, real concurrency, dependencies, fallbacks, replan and rewrite, event order, and state isolation between turns;
-  - memory filters, eval checks, SSE parsing and Streamlit pages (`AppTest`).
+  - graph flows: routing, the cache-first path, real concurrency, dependencies, fallbacks, replan and rewrite, event order, and state isolation between turns;
+  - exact-cache validation (bad outputs are not replayed), turn-lock ownership, log masking;
+  - memory filters and gating, eval checks, judge spend metering, SSE parsing and Streamlit pages (`AppTest`).
 - **Integration tests:**
   - the RLS matrix and database-level blocks;
   - the auth flow (rotation and reuse detection) and rate limits;
   - conversation ownership, the SSE contract, and RLS applied to generated SQL;
-  - persistence, the turn lock, feedback, the coverage card and admin endpoints;
+  - persistence, the turn lock and deadline, member vs admin visibility, daily limits, feedback, the coverage card and admin endpoints;
   - memory and summarisation, worker tasks, the eval runner, the Postgres checkpointer, the Redis 8 vector cache, and data smoke tests.
 
 **CI** (`.github/workflows/ci.yml`) runs on pushes to `main` and `claude/**` branches and on pull requests:
@@ -540,12 +555,12 @@ The golden set (`backend/evals/datasets/golden.jsonl`, 59 cases) is built by `hg
 - **deterministic checks:** answer rate, refusal accuracy, tool routing, data isolation (no other member's IDs) and required content;
 - **RAGAS metrics**, scored by each judge in `EVAL_JUDGES`: faithfulness, answer relevancy and context recall by default; context precision and factual correctness are optional. The case score is the mean across judges, and the spread flags disagreement.
 
-Results are checked against `backend/evals/thresholds.yaml` (exit code 1 on failure), stored in `eval_runs` / `eval_results`, and written as Markdown and JSON reports to `backend/evals/reports/`.
+Results are checked against `backend/evals/thresholds.yaml` (exit code 1 on failure), stored in `eval_runs` / `eval_results`, and written as Markdown and JSON reports to `backend/evals/reports/`. Each run reports its agent cost and its judge cost (summed from the cost OpenRouter returns on every judge call). The admin **Evaluations** page queues one run at a time.
 
 ```bash
 make eval-estimate LIMIT=10                     # plan + cost estimate, no model calls
-uv run hg-eval --per-category 1                 # one case per category (~$0.40 with the 3-judge jury)
-uv run hg-eval --limit 10 --judges 1            # cheapest real run (~$0.31)
+uv run hg-eval --per-category 1                 # one case per category (~$0.30 with the 3-judge jury)
+uv run hg-eval --limit 10 --judges 1            # cheapest real run (~$0.21)
 uv run hg-eval --no-ragas                       # deterministic checks only
 uv run hg-eval --rescore <RUN_ID>               # re-judge stored answers without re-running the agent
 uv run hg-eval --metrics all --categories policy_rag,multi_hop
@@ -553,7 +568,7 @@ uv run hg-eval --metrics all --categories policy_rag,multi_hop
 
 Judge responses are cached on disk (`backend/evals/.cache/`, one cache per judge), so re-scoring unchanged answers costs nothing. The `eval.yml` workflow runs **only on demand** (10 cases by default) and never on a schedule.
 
-**Current baseline:** 10 cases, one per category, 3-judge jury.
+**Current baseline:** 10 cases, one per category, 3-judge jury, measured on the fixed Claude models before the Jev Router became the default.
 
 | Metric | Score |
 |---|---|
@@ -563,7 +578,7 @@ Judge responses are cached on disk (`backend/evals/.cache/`, one cache per judge
 | Faithfulness | 0.80 ❌ (gate 0.85) |
 | Answer relevancy | 0.68 ❌ (gate 0.80) |
 
-The gap comes mainly from answers adding detail nobody asked for. A synthesis prompt fix for that is in place but not yet re-measured. See [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).
+The gap comes mainly from answers adding detail nobody asked for. A synthesis prompt fix for that is in place but not yet re-measured, and the router default has not been evaluated yet. See [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md).
 
 ---
 
@@ -640,7 +655,9 @@ make test-integration  # needs `make infra data`
 | Answers seem to ignore real embeddings, or retrieval looks lexical | The corpus was ingested with `EMBEDDING_PROVIDER=hash`. Set `openrouter` and run `uv run hg-ingest --force`. |
 | Reloading the Streamlit page signs you out | Streamlit keeps the session in memory per browser tab. Navigate with the sidebar (see [Known limitations](#known-limitations)). |
 | The first provider search after a restart is slow | Sandbox workers load pandas and the CSV lake (about 6 s). The API warms them at startup; this time never counts against the code timeout. |
-| `409 turn_in_progress` | A reply is still being generated for that conversation. The lock clears itself after 3 minutes if a process dies. |
+| `409 turn_in_progress` | A reply is still being generated for that conversation. A turn stops after `TURN_TIMEOUT_SECONDS` (150 s); if a process dies, the lock clears itself 30 s after that. |
+| `429 daily_limit` | The member used `DAILY_TURN_LIMIT` turns today. It resets at midnight UTC; raise the limit (or set `0`) for heavy demo sessions. |
+| `409 eval_in_progress` on **Run evaluation** | Another run is queued or running. A run stuck in `running` for more than 3 hours (a dead worker) no longer blocks new ones. |
 | `hg-chat` / API: `persona … not found` | Run `make data` (or `uv run hg-seed`). |
 
 ---
@@ -650,7 +667,8 @@ make test-integration  # needs `make infra data`
 - **Session persistence.** Streamlit sessions are not persisted across page reloads.
 - **Sandbox memory on macOS.** The pandas sandbox's memory limit is enforced only on Linux. On macOS it relies on the wall-clock timeout.
 - **Paraphrases miss the semantic cache.** It serves repeats, not paraphrases (measured distance between paraphrases ≥ 0.18 vs a 0.08 threshold).
-- **Judge cost isn't tracked.** RAGAS judge calls go directly to OpenRouter and are not included in `llm_calls` cost totals.
+- **Router variability.** The Jev Router chooses the serving model per request, so cost and latency vary from turn to turn, and provider prompt caching helps less when the serving model changes.
+- **Judge cost is per run.** RAGAS judge spend appears in each evaluation report, not in `llm_calls` or the Observability dashboard.
 - **Synthetic data only.** No real member data or real insurer policies are included.
 
 ---
@@ -658,6 +676,6 @@ make test-integration  # needs `make infra data`
 ## Further documentation
 
 - [docs/architecture.md](docs/architecture.md): architecture with 7 diagrams
-- [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md): what was built in each phase, design decisions, live measurements and known gaps
+- [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md): what was built in each phase, design decisions, live measurements, the engineering review and open items
 - [DEMO_QUESTIONS.md](DEMO_QUESTIONS.md): persona-driven demo script
 - [specs/](specs/): mission, technical specification and roadmap

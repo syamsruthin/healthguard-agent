@@ -11,7 +11,7 @@ Members' questions cross data sources, as in "Why was my MRI denied, and how do 
 2. **Isolation by construction.** Generated SQL runs on a read-only role under Postgres Row-Level Security, behind a static SQL guard. Generated pandas code runs in a process sandbox. Cross-member probes are refused before any model call.
 3. **Agentic but bounded.** A dependency-aware plan runs independent steps in parallel, with at most one replan and one rewrite. Fallback models keep turns working through provider outages.
 4. **Auditability.** Every turn stores its plan, tool code, sources, verification, per-call tokens, cache hits and cost.
-5. **Cost efficiency.** Provider prompt caching, a scoped semantic answer cache, and right-sized models per role (a fast planner and verifier, stronger code and synthesis models).
+5. **Cost efficiency.** A cost-optimising model router per role with fixed-model fallbacks, provider prompt caching, a scoped semantic answer cache that answers repeated questions without a model call, background model calls only when they have work to do, and spend guards (daily turn cap, sampled online judging, one evaluation run at a time).
 6. **Measured quality.** A golden set built from the data, deterministic checks, a jury of LLM judges from different model families (RAGAS), a CI gate, and online sampling of live answers.
 
 ## Data simulation profile

@@ -10,7 +10,7 @@ Diagrams render on GitHub. `make diagrams` also exports them as SVG to `docs/dia
 flowchart LR
     U([Member / admin browser]) --> UI["Streamlit UI<br/>login · chat · coverage · memory · admin"]
     UI -- "REST + SSE (JWT)" --> API["FastAPI /api/v1<br/>auth · rate limits · chat · admin"]
-    API --> G["LangGraph agent<br/>understand → cache → execute → synthesize → verify"]
+    API --> G["LangGraph agent<br/>cache-first → understand → execute → synthesize → verify"]
     API -- "follow-up jobs" --> Q[(Redis 8<br/>arq queue)]
     Q --> W["arq worker<br/>titles · summaries · memories · online eval · offline eval"]
     G --> LLM["LLM layer<br/>per-role models · prompt caching · usage"]
@@ -33,11 +33,15 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    S((start)) --> U["understand<br/>prefilter + one FAST call:<br/>scope · safety · rewrite · plan"]
+    S((start)) -- "opening question" --> CF{"cache_first<br/>semantic cache, no model call"}
+    S -- "follow-up" --> U
+    CF -- hit --> F
+    CF -- miss --> U["understand<br/>prefilter + one FAST call:<br/>scope · safety · rewrite · plan"]
     U -- "blocked / model down" --> F
     U -- "empty plan (small talk)" --> SY
     U -- "replan round" --> X
-    U -- "plan" --> C{"cache_lookup<br/>semantic cache"}
+    U -- "plan, opening question<br/>(cache already checked)" --> X
+    U -- "plan, follow-up" --> C{"cache_lookup<br/>on the standalone rewrite"}
     C -- hit --> F
     C -- miss --> X["execute<br/>dependency levels run in parallel<br/>sql · providers · policy_search"]
     X -- "every step failed" --> F
@@ -52,7 +56,9 @@ flowchart TD
     F --> E((end))
 ```
 
+- An opening question (no history or summary) is self-contained, so `cache_first` looks it up by its normalised text before any model call: the member's own scope first, then public answers. Messages the deterministic prefilter would block skip the lookup. A follow-up needs the planner's rewrite, so its lookup (`cache_lookup`) runs after `understand`.
 - The state is reset on every turn (`initial_state`), so a checkpointed thread never carries one turn's results into the next. The Postgres checkpointer stores the final state per conversation (`thread_id` = conversation id).
+- A whole turn is bounded by `TURN_TIMEOUT_SECONDS` (the chat service cancels the graph and answers with the `timeout` fallback).
 - `planning.sanitize_plan` repairs the model's plan: it drops unknown tools and empty tasks, renames duplicate IDs, removes forward, self and unknown dependencies, and enforces the step budget.
 - An ungrounded draft is rewritten once without the flagged claims. Only if the rewrite also fails is it replaced with the insufficient-context fallback.
 
@@ -74,7 +80,8 @@ sequenceDiagram
     API->>T: start background task (queue → SSE)
     T-->>UI: meta
     T->>DB: user context · memory context · data version
-    T->>G: run graph
+    T->>G: run graph (bounded by TURN_TIMEOUT_SECONDS)
+    G->>G: cache_first (opening question, a hit ends the turn here)
     G->>OR: understand (prompt-cached prefix)
     G-->>UI: status, plan
     par independent steps
@@ -87,8 +94,8 @@ sequenceDiagram
     G-->>UI: token … token, citations
     G->>OR: verify
     T->>DB: assistant message · trace · llm_calls
-    T-->>UI: final (answer, citations, usage, trace)
-    T->>T: semantic-cache store · enqueue follow-ups · release lock
+    T-->>UI: final (answer, plan, steps, citations, usage, admin-only trace)
+    T->>T: semantic-cache store · enqueue follow-ups that have work · release own lock
 ```
 
 A client disconnect never cancels the turn task, so the answer is always persisted.
@@ -146,7 +153,7 @@ There are three schemas. `app` holds identity, chat, memory, traces, usage and e
 ```mermaid
 flowchart LR
     Q[New question] --> SC{"Semantic answer cache<br/>Redis vector index<br/>scope · data version · prompt version"}
-    SC -- "hit (cosine distance ≤ 0.08)" --> A[Verified answer replayed<br/>one FAST call, no tools]
+    SC -- "hit (cosine distance ≤ 0.08)" --> A[Verified answer replayed<br/>opening question: no model call<br/>follow-up: one FAST call]
     SC -- miss --> P[Plan + tools + synthesis]
     P --> EX{"Exact LLM cache<br/>temperature-0 calls"}
     EX -- miss --> PC["Provider prompt cache<br/>stable system prefixes<br/>cache_control breakpoints"]
@@ -156,10 +163,10 @@ flowchart LR
 
 | Layer | Key | Scope and safety | Measured effect |
 |---|---|---|---|
-| Semantic answer cache | Normalised raw message for a first turn; the rewritten query when the turn depends on history | `public`, `member:{id}` or `role:admin`. Members read their own scope first. A turn whose answer or rewrite mentions the member's identity or plan is stored privately. Only verified, fully successful turns are stored. | A repeated general question costs $0.0002 instead of about $0.01 |
-| Exact LLM cache | Hash of model, fallbacks, messages, params and prompt version | Byte-identical input only | — |
+| Semantic answer cache | Normalised raw message for an opening question (looked up before planning); the rewritten query when the turn depends on history (looked up after planning) | `public`, `member:{id}` or `role:admin`. Members read their own scope first. A turn whose answer or rewrite mentions the member's identity or plan is stored privately. Only verified, fully successful turns are stored. | A repeated general question cost $0.0002 instead of about $0.01 when planning ran first; an opening question now hits with no model call |
+| Exact LLM cache | Hash of model, fallbacks, messages, params and prompt version | Byte-identical input only. Outputs that fail validation (bad JSON, SQL or pandas the guard, sandbox or database rejected) are dropped so they are never replayed | — |
 | Provider prompt cache | Stable prompt prefixes (understand ≈ 4.9k tokens, SQL ≈ 5.8k) | Per provider | 54–60 % of planner and SQL prompt tokens served from cache; repeat turn −40 % cost |
-| Embedding cache | Model + text hash | — | — |
+| Embedding cache | Model + text hash | — | The cache key and the memory search embed the same normalised text, so one call serves both |
 
 ## 6. Evaluation
 
@@ -172,18 +179,18 @@ flowchart LR
     C --> GATE{thresholds.yaml}
     J --> GATE
     GATE --> REP["eval_runs / eval_results<br/>Markdown + JSON reports<br/>exit code for CI"]
-    LIVE["Live turns"] -- "sample + every 👎" --> OE["Online jury (worker)<br/>faithfulness · relevancy"] --> DASH[Admin dashboards]
+    LIVE["Live turns"] -- "5 % sample + every 👎<br/>(each answer once)" --> OE["Online jury (worker)<br/>faithfulness · relevancy"] --> DASH[Admin dashboards]
     REP --> DASH
 ```
 
-`hg-eval --dry-run` prints a cost estimate before anything runs. Judge responses are cached on disk (`backend/evals/.cache/`), so re-running unchanged cases costs nothing. `eval.yml` is manual-only.
+`hg-eval --dry-run` prints a cost estimate before anything runs, and every report shows the agent cost and the judge cost (summed from OpenRouter's per-call cost). Judge responses are cached on disk (`backend/evals/.cache/`), so re-running unchanged cases costs nothing. `eval.yml` is manual-only, and the admin API queues one run at a time.
 
 ## 7. Security boundaries
 
 ```mermaid
 flowchart TD
     REQ[Request] --> JWT{"JWT access token<br/>15 min · refresh rotation<br/>reuse revokes the family"}
-    JWT --> RL{"Rate limits<br/>auth per IP · chat per user"}
+    JWT --> RL{"Rate limits<br/>auth per IP · chat and feedback per user<br/>daily turn cap per member"}
     RL --> OWN{"Conversation ownership<br/>others get 404"}
     OWN --> PRE{"Prefilter<br/>injection patterns · other members' IDs"}
     PRE --> LLMG{"understand<br/>scope + safety classification"}
@@ -201,7 +208,8 @@ Notes:
 - **Self-registration.** Self-registered accounts are never linked to member records, because linking requires identity verification. They can ask general plan and policy questions.
 - **Sandbox memory limit.** The pandas sandbox enforces an address-space limit only on Linux, where it reads `/proc`. On macOS, development relies on the wall-clock timeout.
 - **Long-term memory.** Memory stores only non-clinical preferences. A deterministic filter rejects IDs, amounts, dates, contact details and clinical terms, even when the extraction model proposes them.
-- **Logs.** PII (emails, phone numbers, SSNs, dates) is masked in structured logs.
+- **Logs.** PII (emails, phone numbers, SSNs, dates, member IDs) is masked in structured logs, including values nested in lists and objects.
+- **What members see.** Members get each answer's plan, steps, verification verdict and citations. The full trace and the generated SQL / pandas code go to admins only. Access tokens carry only the user id and role.
 
 ## Observability
 

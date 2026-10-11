@@ -87,5 +87,8 @@ Status and measured results: [docs/IMPLEMENTATION_STATUS.md](../docs/IMPLEMENTAT
 - [x] **Worker**: arq tasks for titles, summaries, memories, online LLM-judge jury, offline evals.
 - [x] **UI**: multipage Streamlit with streaming chat, coverage, memory controls and admin dashboards.
 - [x] **Evaluation**: golden set from the database, `hg-eval` with deterministic checks + RAGAS judge jury + quality gate.
-- [x] **Tests**: 200+ unit / integration tests, a live persona suite, combined coverage gate.
+- [x] **Tests**: ~250 unit / integration tests, a live persona suite, combined coverage gate.
+- [x] **Router**: the TypeSafe Jev Router as the default for planning, code and synthesis, with fixed-model fallbacks.
+- [x] **Engineering review**: validated-only exact cache, turn deadline and owned locks, PII-safe logs, cache-first answers, gated background calls, spend guards, judge cost, admin-only traces, shared codegen loop.
+- [ ] **Evaluation on the router**: re-run the golden suite and meet the RAGAS gate.
 - **Commits**: one per phase on `claude/vigilant-wozniak-f6rbb3`.

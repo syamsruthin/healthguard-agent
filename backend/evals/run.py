@@ -50,8 +50,9 @@ log = get_logger(__name__)
 THRESHOLDS = Path(__file__).parent / "thresholds.yaml"
 _SOURCE_SPLIT = re.compile(r"\n\n(?=\[[SD]\d+\])")
 
-# Rough per-call costs (USD) for the default models, used only for the pre-run estimate.
-_TURN_COST = 0.025
+# Rough costs (USD) used only for the pre-run estimate: an agent turn on the default Jev Router
+# (measured $0.009–0.017; $0.023–0.039 on fixed Claude models) and one fixed-model judge call.
+_TURN_COST = 0.015
 _JUDGE_CALLS_PER_METRIC = {
     "faithfulness": 2,
     "answer_relevancy": 1,

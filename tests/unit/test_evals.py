@@ -72,7 +72,7 @@ def test_aggregate_rates() -> None:
 def test_cost_estimate_scales_with_cases_and_judges() -> None:
     cases = [ANSWER_CASE, {**BLOCK_CASE, "prior_turns": ["hi"]}]
     no_judges = estimate_cost(cases, (), 0)
-    assert no_judges == pytest.approx(3 * 0.025, abs=0.01)
+    assert no_judges == pytest.approx(3 * 0.015, abs=0.01)
     many = [ANSWER_CASE] * 20
     assert (
         estimate_cost(many, ("faithfulness",), 3)
