@@ -6,7 +6,7 @@
 
 > **Current state.** Every planned phase is built, tested and pushed. The full Docker stack runs, GitHub CI passes, and all personas were verified against live models. Open items: the RAGAS quality gate is not yet met, and the evaluation baseline was measured on the fixed models before the Jev Router became the default (see [§7](#7-open-items)).
 
-Related documents: [README](../README.md) (setup, usage, configuration), [architecture](architecture.md) (7 diagrams), [technical specification](../specs/TechnicalSpecifications.md), [demo script](../DEMO_QUESTIONS.md).
+Related documents: [README](../README.md) (setup, usage, configuration), [architecture](architecture.md) (7 diagrams), [decision records](adr/README.md), [interview guide](interview/INTERVIEW_GUIDE.md), [technical specification](../specs/TechnicalSpecifications.md), [demo script](../DEMO_QUESTIONS.md).
 
 ---
 
@@ -35,6 +35,8 @@ Related documents: [README](../README.md) (setup, usage, configuration), [archit
 ---
 
 ## 2. Decisions
+
+Summary only. Each decision's context, rationale, rejected alternatives and consequences are in the [architecture decision records](adr/README.md).
 
 | Area | Decision |
 |---|---|

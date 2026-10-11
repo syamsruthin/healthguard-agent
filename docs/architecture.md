@@ -4,6 +4,8 @@ HealthGuard is an agentic RAG assistant for health-insurance members. A LangGrap
 
 Diagrams render on GitHub. `make diagrams` also exports them as SVG to `docs/diagrams/`.
 
+The reasoning behind each design choice (context, alternatives, trade-offs) is in the [architecture decision records](adr/README.md).
+
 ## 1. System view
 
 ```mermaid
