@@ -84,6 +84,7 @@ Each record follows the same template: **Status** (with the commit that introduc
 | [0036](0036-testing-strategy.md) | Scripted FakeLLM and fakes at every seam; paid suites opt-in | ~250 free tests per push, including outage paths |
 | [0037](0037-packaging-and-deployment.md) | One non-root image, one process per container, production config guards | Reproducible, race-free start-up; insecure configs can't ship |
 | [0038](0038-streamlit-thin-client.md) | Streamlit strictly over the public API | Proportionate UI effort; replaceable without backend changes |
+| [0039](0039-aws-deployment-target.md) | AWS target: ECS on Fargate, Aurora PostgreSQL + pgvector, ElastiCache for Valkey, ALB + WAF (proposed; [full design](../deployment/AWS_DEPLOYMENT.md)) | One-to-one mapping of Compose onto managed services that keep RLS, SSE and the process model intact |
 
 ## Cross-cutting principles
 

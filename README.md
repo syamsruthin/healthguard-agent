@@ -676,7 +676,8 @@ make test-integration  # needs `make infra data`
 ## Further documentation
 
 - [docs/architecture.md](docs/architecture.md): architecture with 7 diagrams
-- [docs/adr/](docs/adr/README.md): 38 architecture decision records, each with its context, rationale, rejected alternatives and consequences
+- [docs/deployment/AWS_DEPLOYMENT.md](docs/deployment/AWS_DEPLOYMENT.md): AWS deployment design (ECS on Fargate, Aurora PostgreSQL + pgvector, ElastiCache, ALB + WAF, CI/CD, security, scaling, DR, cost) and the changes it requires
+- [docs/adr/](docs/adr/README.md): 39 architecture decision records, each with its context, rationale, rejected alternatives and consequences
 - [docs/interview/INTERVIEW_GUIDE.md](docs/interview/INTERVIEW_GUIDE.md): how to present and defend the architecture (pitches, request walk-through, key numbers, follow-up questions, scaling, known weaknesses)
 - [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md): what was built in each phase, design decisions, live measurements, the engineering review and open items
 - [DEMO_QUESTIONS.md](DEMO_QUESTIONS.md): persona-driven demo script

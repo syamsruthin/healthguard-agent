@@ -234,6 +234,8 @@ Expect: "How would this handle a million members / 100 requests per second?" Wal
 | **Worker** | One arq worker | Horizontal workers; separate queues so long evaluations don't starve follow-ups. |
 | **Observability** | Prometheus per process; trace table | Prometheus scraping per replica (already one process per container); ship spans to a managed backend; sampled traces. |
 
+**Cloud deployment:** the AWS design (service by service, with the reasons, gotchas, cost and an interview Q&A) is in [docs/deployment/AWS_DEPLOYMENT.md](../deployment/AWS_DEPLOYMENT.md#23-interview-questions-on-the-deployment).
+
 **Back-of-envelope cost (illustrative assumptions, say them out loud):** 1M members × 2 % daily active × 3 questions = 60k turns/day. At ~$0.012 per uncached turn that's ≈ $720/day (≈ $22k/month) before caching; every point of semantic-cache hit rate and prompt-cache share comes straight off that. The per-call ledger is what lets you verify these numbers in production rather than guess.
 
 ---
