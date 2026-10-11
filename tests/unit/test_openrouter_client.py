@@ -12,6 +12,7 @@ from openai import AsyncOpenAI
 from pydantic import BaseModel
 
 from backend.core.config import settings
+from backend.llm import cache as llm_cache
 from backend.llm.client import LLMError, OpenRouterClient
 from backend.llm.registry import Role
 from backend.llm.usage import start_collection, stop_collection
@@ -176,3 +177,45 @@ async def test_router_structured_repair_uses_a_fixed_fallback_model(client) -> N
     assert out.answer == "ok"
     assert sent[0]["model"] == settings.model_fast == "typesafe/jev-router"
     assert sent[1]["model"] == settings.model_fast_fallbacks[0]  # the repair does not go back to the router
+
+
+async def test_invalid_structured_output_is_not_replayed_from_the_cache(
+    client, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "llm_exact_cache_enabled", True)
+    replies = iter([_completion("not json"), _completion('{"answer": "fixed"}')])
+    c, sent = client(lambda r: httpx.Response(200, json=next(replies)))
+    first = await c.structured(Role.FAST, MESSAGES, _Out, name="verify")
+    again = await c.structured(Role.FAST, MESSAGES, _Out, name="verify")
+    # The repaired output replaced the bad one under the original key: no second model call or repair.
+    assert first.answer == again.answer == "fixed" and len(sent) == 2
+
+
+async def test_forgotten_cache_entry_is_gone(client, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(settings, "llm_exact_cache_enabled", True)
+    c, sent = client(lambda r: httpx.Response(200, json=_completion("SELECT bad")))
+    first = await c.complete(Role.CODE, MESSAGES, name="sql")
+    assert first.cache_key
+    await llm_cache.forget(first.cache_key)
+    second = await c.complete(Role.CODE, MESSAGES, name="sql")
+    assert not second.cached and len(sent) == 2
+
+
+async def test_stream_closed_early_is_still_recorded(client) -> None:
+    chunk = {
+        "id": "g",
+        "object": "chat.completion.chunk",
+        "created": 0,
+        "model": "anthropic/claude-sonnet-5.5",
+        "choices": [{"index": 0, "delta": {"content": "Hello "}, "finish_reason": None}],
+    }
+    body = f"data: {json.dumps(chunk)}\n\n" * 3 + "data: [DONE]\n\n"
+    c, _ = client(lambda r: httpx.Response(200, text=body, headers={"content-type": "text/event-stream"}))
+    collector, token = start_collection()
+    try:
+        stream = c.stream(Role.SYNTH, MESSAGES, name="synthesize")
+        assert await anext(stream) == "Hello "
+        await stream.aclose()  # the consumer goes away mid-answer
+    finally:
+        stop_collection(token)
+    assert len(collector.calls) == 1 and collector.calls[0].error == "stream closed before completion"

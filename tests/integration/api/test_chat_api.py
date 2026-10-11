@@ -240,3 +240,28 @@ async def test_admin_can_queue_an_eval_run(client, jobs) -> None:
     async with SessionLocal() as session:
         await session.delete(await session.get(EvalRun, uuid.UUID(run_id)))
         await session.commit()
+
+
+async def test_turn_deadline_returns_a_fallback_and_frees_the_conversation(
+    client, fake_llm, monkeypatch
+) -> None:
+    import asyncio
+
+    from backend.core.config import settings
+    from backend.services import chat_service
+
+    async def slow_graph(*_args, **_kwargs):
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr(settings, "turn_timeout_seconds", 0.2)
+    monkeypatch.setattr(chat_service, "run_graph", slow_graph)
+    tokens = await login(client, "maria.garcia@demo.healthguard.dev")
+    cid = await _conversation(client, tokens)
+    resp = await client.post(
+        f"{API}/conversations/{cid}/messages/stream", json={"message": "hello"}, headers=auth(tokens)
+    )
+    events = parse_sse(resp.text)
+    assert any(e["type"] == "error" and e["code"] == "turn_timeout" for e in events)
+    final = events[-1]
+    assert final["type"] == "final" and final["outcome"] == "error" and final["fallback"] == "timeout"
+    assert not await get_redis().exists(f"hg:turn:{cid}")

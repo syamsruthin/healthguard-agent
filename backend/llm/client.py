@@ -54,6 +54,7 @@ class LLMResult:
     model: str
     usage: dict[str, Any]
     cached: bool = False
+    cache_key: str | None = None  # exact-cache entry holding this text; `llm_cache.forget` it if unusable
 
 
 class LLMClient(Protocol):
@@ -187,7 +188,7 @@ class OpenRouterClient:
             hit = await llm_cache.get(key)
             if hit:
                 record(LLMCallRecord(role=role.value, name=name, model=hit["model"], exact_cache_hit=True))
-                return LLMResult(text=hit["text"], model=hit["model"], usage={}, cached=True)
+                return LLMResult(text=hit["text"], model=hit["model"], usage={}, cached=True, cache_key=key)
 
         self._check_configured()
         kwargs: dict[str, Any] = {
@@ -236,7 +237,7 @@ class OpenRouterClient:
         end_llm_span(llm_span, model=served, usage=usage)
         if key and text:
             await llm_cache.put(key, {"text": text, "model": served})
-        return LLMResult(text=text, model=served, usage=usage)
+        return LLMResult(text=text, model=served, usage=usage, cache_key=key if text else None)
 
     async def structured(
         self,
@@ -266,6 +267,7 @@ class OpenRouterClient:
             return schema.model_validate_json(extract_json(result.text))
         except (ValueError, ValidationError) as exc:
             log.info("structured_output_repair", call=name, error=str(exc)[:200])
+            await llm_cache.forget(result.cache_key)  # never replay output that failed the schema
             repair = [
                 *messages,
                 {"role": "assistant", "content": result.text[:4000]},
@@ -290,9 +292,12 @@ class OpenRouterClient:
                 response_format=response_format,
             )
             try:
-                return schema.model_validate_json(extract_json(fixed.text))
+                parsed = schema.model_validate_json(extract_json(fixed.text))
             except (ValueError, ValidationError) as exc2:
                 raise LLMError(f"LLM call '{name}' returned invalid structured output") from exc2
+            if result.cache_key:  # the original request now replays the repaired, valid output
+                await llm_cache.put(result.cache_key, {"text": fixed.text, "model": fixed.model})
+            return parsed
 
     async def stream(
         self,
@@ -320,6 +325,9 @@ class OpenRouterClient:
         t0 = time.monotonic()
         served = spec.model
         usage: dict[str, Any] = {}
+        error: str | None = None
+        resp: Any = None
+        completed = False
         llm_span = start_span(
             "llm.stream", llm_role=role.value, llm_call=name, llm_requested_model=spec.model
         )
@@ -333,29 +341,32 @@ class OpenRouterClient:
                         yield delta
                 if getattr(chunk, "usage", None):
                     usage = parse_usage(chunk.usage)
+            completed = True
         except openai.OpenAIError as exc:
+            error = str(exc)
             LLM_ERRORS.labels(role=role.value).inc()
+            raise LLMError(f"LLM stream '{name}' failed: {exc.__class__.__name__}") from exc
+        finally:
+            # Also runs when the consumer stops early (client gone, turn deadline): close the HTTP
+            # stream and still account for the call.
+            if not completed and error is None:
+                error = "stream closed before completion"
+                if resp is not None:
+                    try:
+                        await resp.close()
+                    except Exception as close_exc:
+                        log.debug("llm_stream_close_failed", error=str(close_exc)[:200])
+            end_llm_span(llm_span, model=served, usage=usage, error=error)
             record(
                 LLMCallRecord(
                     role=role.value,
                     name=name,
-                    model=spec.model,
-                    error=str(exc)[:500],
+                    model=served,
                     latency_ms=int((time.monotonic() - t0) * 1000),
+                    error=error[:500] if error else None,
+                    **usage,
                 )
             )
-            end_llm_span(llm_span, model=spec.model, usage={}, error=str(exc))
-            raise LLMError(f"LLM stream '{name}' failed: {exc.__class__.__name__}") from exc
-        end_llm_span(llm_span, model=served, usage=usage)
-        record(
-            LLMCallRecord(
-                role=role.value,
-                name=name,
-                model=served,
-                latency_ms=int((time.monotonic() - t0) * 1000),
-                **usage,
-            )
-        )
 
 
 # ── Accessor (dependency-injection seam for tests) ──────────────────────

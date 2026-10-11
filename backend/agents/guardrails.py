@@ -47,6 +47,10 @@ FALLBACKS: dict[str, str] = {
         "I couldn't retrieve the information needed to answer that right now. Please try again, or contact "
         "Member Services at 1-800-446-3623."
     ),
+    "timeout": (
+        "That took longer than expected, so I stopped before finishing. Please try again, or ask a narrower "
+        "question. You can also call Member Services at 1-800-446-3623."
+    ),
 }
 
 _INJECTION_PATTERNS = [

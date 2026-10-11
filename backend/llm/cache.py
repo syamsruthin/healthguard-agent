@@ -5,6 +5,8 @@ Only deterministic (temperature 0, non-streaming) calls are cached. The key
 hashes the model, fallbacks, full message list, parameters and prompt
 version, so a cached completion is only ever returned for byte-identical
 input — it never crosses a context boundary it could not already see.
+Callers `forget` an entry whose output fails validation (bad JSON, SQL the
+guard or database rejects), so a bad completion is not replayed.
 """
 
 from __future__ import annotations
@@ -46,3 +48,13 @@ async def put(key: str, value: dict[str, Any]) -> None:
         await get_redis().set(key, json.dumps(value), ex=settings.llm_exact_cache_ttl_seconds)
     except Exception as exc:
         log.warning("llm_cache_put_failed", error=str(exc))
+
+
+async def forget(key: str | None) -> None:
+    """Drop an entry whose output turned out to be unusable, so it is never replayed."""
+    if not key or not settings.llm_exact_cache_enabled:
+        return
+    try:
+        await get_redis().delete(key)
+    except Exception as exc:
+        log.warning("llm_cache_forget_failed", error=str(exc))

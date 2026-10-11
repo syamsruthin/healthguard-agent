@@ -16,6 +16,7 @@ from backend.core.config import settings
 from backend.core.logging import get_logger
 from backend.core.telemetry import TOOL_EVENTS
 from backend.db.session import get_agent_pool
+from backend.llm import cache as llm_cache
 from backend.llm.client import LLMError, get_llm, strip_fences
 from backend.llm.prompts.sql import build_sql_messages
 from backend.llm.registry import Role
@@ -60,6 +61,7 @@ async def run_sql_tool(step_id: str, task: str, user: UserContext, prior: str = 
     attempts = 0
     for attempt in range(settings.max_tool_retries + 1):
         attempts = attempt + 1
+        gen = None
         try:
             gen = await llm.complete(
                 Role.CODE,
@@ -97,6 +99,8 @@ async def run_sql_tool(step_id: str, task: str, user: UserContext, prior: str = 
                 "db_error",
             )
             TOOL_EVENTS.labels(tool="sql", outcome="db_error").inc()
+        if gen is not None:
+            await llm_cache.forget(gen.cache_key)  # a rejected first attempt must not be replayed
         log.info("sql_tool_retry", step=step_id, attempt=attempts, error=error[:200])
     return ToolResult(
         step_id=step_id,

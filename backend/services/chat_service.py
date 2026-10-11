@@ -2,12 +2,14 @@
 One chat turn, end to end.
 
 HTTP phase (`prepare_turn`, errors become real status codes):
-  input checks → ownership → per-conversation turn lock → persist the user message.
+  input checks → ownership → per-conversation turn lock (owned by the turn id,
+  outliving the turn deadline) → persist the user message.
 
 Stream phase (`execute_turn`, runs in a background task so a client
 disconnect never cancels persistence):
   meta event → usage collection → user / memory context → agent graph
-  (events forwarded live) → persist assistant message, trace and LLM calls →
+  (events forwarded live, bounded by TURN_TIMEOUT_SECONDS) → persist assistant
+  message, trace and LLM calls →
   final event → semantic-cache store → follow-up jobs.
 """
 
@@ -24,6 +26,7 @@ from decimal import Decimal
 from typing import Any
 
 import structlog
+from redis.exceptions import WatchError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sse_starlette import EventSourceResponse
 
@@ -49,7 +52,6 @@ from backend.workers.queue import get_enqueuer
 
 log = get_logger(__name__)
 EventSink = Callable[[dict[str, Any]], Awaitable[None]]
-_LOCK_SECONDS = 180
 _background: set[asyncio.Task[None]] = set()
 
 
@@ -69,6 +71,11 @@ async def _noop(_: dict[str, Any]) -> None:
     return None
 
 
+def lock_seconds() -> int:
+    """The turn lock outlives the turn deadline, so it can only expire if the process died."""
+    return int(settings.turn_timeout_seconds) + 30
+
+
 async def prepare_turn(
     session: AsyncSession, user: User, conversation_id: uuid.UUID, message: str
 ) -> PreparedTurn:
@@ -81,7 +88,8 @@ async def prepare_turn(
         )
     conversation = await conversation_service.get_owned(session, user, conversation_id)
     lock_key = f"hg:turn:{conversation.id}"
-    if not await get_redis().set(lock_key, "1", nx=True, ex=_LOCK_SECONDS):
+    turn_id = str(uuid.uuid4())
+    if not await get_redis().set(lock_key, turn_id, nx=True, ex=lock_seconds()):
         raise ConflictError("A reply is still being generated for this conversation", code="turn_in_progress")
     try:
         first_turn = await conversation_service.message_count(session, conversation.id) == 0
@@ -90,25 +98,41 @@ async def prepare_turn(
         conversation.updated_at = utcnow()
         await session.commit()
     except Exception:
-        await get_redis().delete(lock_key)
+        await release_lock(lock_key, turn_id)
         raise
     return PreparedTurn(
         user_id=user.id,
         conversation_id=conversation.id,
         user_message_id=user_msg.id,
         message=message,
-        turn_id=str(uuid.uuid4()),
+        turn_id=turn_id,
         first_turn=first_turn,
         lock_key=lock_key,
         started=time.monotonic(),
     )
 
 
-async def release(prepared: PreparedTurn) -> None:
+async def release_lock(lock_key: str, owner: str) -> bool:
+    """Delete the turn lock only if this turn still owns it (compare-and-delete under WATCH)."""
     try:
-        await get_redis().delete(prepared.lock_key)
+        async with get_redis().pipeline() as pipe:
+            await pipe.watch(lock_key)
+            if await pipe.get(lock_key) != owner:
+                await pipe.unwatch()
+                return False
+            pipe.multi()
+            pipe.delete(lock_key)
+            await pipe.execute()
+            return True
+    except WatchError:  # the lock changed hands while we checked
+        return False
     except Exception as exc:
         log.warning("turn_lock_release_failed", error=str(exc)[:200])
+        return False
+
+
+async def release(prepared: PreparedTurn) -> None:
+    await release_lock(prepared.lock_key, prepared.turn_id)
 
 
 def _tool_summaries(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -267,12 +291,20 @@ async def execute_turn(prepared: PreparedTurn, sink: EventSink = _noop) -> dict[
                 data_version=await get_data_version(),
             )
         )
-        final = await run_graph(
-            get_graph(),
-            state,  # type: ignore[arg-type]
-            thread_id=str(prepared.conversation_id),
-            sink=sink,
+        async with asyncio.timeout(settings.turn_timeout_seconds):
+            final = await run_graph(
+                get_graph(),
+                state,  # type: ignore[arg-type]
+                thread_id=str(prepared.conversation_id),
+                sink=sink,
+            )
+    except TimeoutError:
+        log.warning("turn_timed_out", timeout_s=settings.turn_timeout_seconds)
+        final = {**state, "outcome": "error", "fallback": "timeout", "answer": FALLBACKS["timeout"]}
+        await sink(
+            {"type": "error", "code": "turn_timeout", "message": "The turn took too long", "retryable": True}
         )
+        await sink({"type": "answer_replaced", "answer": final["answer"], "reason": "timeout"})
     except Exception as exc:
         log.exception("turn_failed")
         reason = "llm_unavailable"

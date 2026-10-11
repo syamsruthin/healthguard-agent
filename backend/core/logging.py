@@ -23,9 +23,20 @@ _PII_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+"), "<email>"),
     (re.compile(r"\b(?:\+?1[-. ]?)?\(?\d{3}\)?[-. ]?\d{3}[-. ]?\d{4}\b"), "<phone>"),
     (re.compile(r"\b(19|20)\d{2}-\d{2}-\d{2}\b"), "<date>"),
+    (re.compile(r"\bM\d{6}\b", re.IGNORECASE), "<member_id>"),
 ]
 
-_SKIP_KEYS = {"event", "level", "timestamp", "logger", "request_id", "trace_id", "conversation_id"}
+_SKIP_KEYS = {
+    "event",
+    "level",
+    "timestamp",
+    "logger",
+    "request_id",
+    "trace_id",
+    "conversation_id",
+    "exc_info",
+    "stack_info",
+}
 
 
 def mask_pii(text: str) -> str:
@@ -34,12 +45,24 @@ def mask_pii(text: str) -> str:
     return text
 
 
+def _mask(value: Any, depth: int = 0) -> Any:
+    """Mask strings, including those nested in lists, tuples and dicts (e.g. lists of claims)."""
+    if isinstance(value, str):
+        return mask_pii(value)
+    if depth >= 4:
+        return value
+    if isinstance(value, dict):
+        return {k: _mask(v, depth + 1) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [_mask(v, depth + 1) for v in value]
+    return value
+
+
 def _pii_processor(_: Any, __: str, event_dict: dict[str, Any]) -> dict[str, Any]:
     for key, value in list(event_dict.items()):
         if key in _SKIP_KEYS:
             continue
-        if isinstance(value, str):
-            event_dict[key] = mask_pii(value)
+        event_dict[key] = _mask(value)
     if isinstance(event_dict.get("event"), str):
         event_dict["event"] = mask_pii(event_dict["event"])
     return event_dict
