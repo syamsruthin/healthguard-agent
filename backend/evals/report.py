@@ -49,9 +49,9 @@ def write_reports(
     lines = [
         f"# Evaluation run `{run_id}` — {'PASSED' if passed else 'FAILED'}",
         "",
-        f"- Cases: {summary['cases']} ({summary['errors']} errors) · cost ${summary['cost_usd']:.4f} "
-        f"(${summary['cost_per_case_usd']:.4f}/case) · latency p50 {summary['latency_p50_ms'] / 1000:.1f}s / "
-        f"p95 {summary['latency_p95_ms'] / 1000:.1f}s",
+        f"- Cases: {summary['cases']} ({summary['errors']} errors) · agent cost ${summary['cost_usd']:.4f} "
+        f"(${summary['cost_per_case_usd']:.4f}/case) · judge cost ${summary.get('judge_cost_usd', 0.0):.4f} · "
+        f"latency p50 {summary['latency_p50_ms'] / 1000:.1f}s / p95 {summary['latency_p95_ms'] / 1000:.1f}s",
         f"- Judges: {', '.join(config.get('judges') or []) or 'none'} · metrics: {', '.join(config.get('metrics') or []) or 'none'}",
         "",
         "## Metrics",

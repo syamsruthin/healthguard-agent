@@ -11,7 +11,7 @@ import uuid
 from statistics import mean
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.core.config import settings
@@ -61,6 +61,9 @@ async def _judge(model: str, messages: list[dict[str, Any]]) -> JudgeScores | No
 async def score_message(session: AsyncSession, message_id: uuid.UUID) -> dict[str, float] | None:
     message = await session.get(Message, message_id)
     if message is None or message.role != "assistant" or message.blocked:
+        return None
+    already = await session.execute(select(exists().where(OnlineEvalScore.message_id == message_id)))
+    if already.scalar():  # a sampled answer later thumbed down (or re-rated) is not judged again
         return None
     question, sources = await _turn_inputs(session, message)
     messages = build_judge_messages(question=question, sources=sources, answer=message.content)

@@ -1,16 +1,25 @@
 """
 The HealthGuard agent graph (LangGraph).
 
-    START → understand ─┬─ blocked / error ───────────────────────────────→ finalize → END
-                        ├─ small talk (empty plan) → synthesize ──────────→ finalize
-                        └─ cache_lookup ─┬─ hit ──────────────────────────→ finalize
-                                         └─ execute → synthesize → verify ┬→ finalize
-                                                                          ├→ synthesize (rewrite without
-                                                                          │  unsupported claims, once)
-                                                                          └→ replan → understand → execute …
+    START ─┬─ opening question → cache_first ─┬─ hit (no model call) ─────→ finalize → END
+           │                                  └─ miss ─┐
+           └─ follow-up ───────────────────────────────┴→ understand
 
-`thread_id` is the conversation id. Every turn starts from `initial_state()`,
-so the checkpoint never leaks one turn's results into the next.
+    understand ─┬─ blocked / error ───────────────────────────→ finalize
+                ├─ small talk (empty plan) → synthesize ───────→ finalize
+                ├─ opening question (cache already checked) ──→ execute
+                └─ follow-up → cache_lookup ─┬─ hit ──────────→ finalize
+                                             └─ miss ─────────→ execute
+
+    execute → synthesize → verify ─┬→ finalize
+                                   ├→ synthesize (rewrite without unsupported claims, once)
+                                   └→ replan → understand → execute …
+
+An opening question is self-contained, so the semantic cache is keyed on its
+normalised text and checked before any LLM call; a follow-up needs the
+planner's standalone rewrite first. `thread_id` is the conversation id. Every
+turn starts from `initial_state()`, so the checkpoint never leaks one turn's
+results into the next.
 """
 
 from __future__ import annotations
@@ -25,9 +34,27 @@ from langgraph.graph.state import CompiledStateGraph
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
-from backend.agents.nodes import cache_lookup, execute, finalize, replan, synthesize, understand, verify
+from backend.agents.nodes import (
+    cache_first,
+    cache_lookup,
+    execute,
+    finalize,
+    replan,
+    synthesize,
+    understand,
+    verify,
+)
 from backend.agents.state import AgentState
 from backend.core.config import settings
+
+
+def route_start(state: AgentState) -> str:
+    opening = not state.get("recent_turns") and not state.get("summary")
+    return "cache_first" if opening and settings.semantic_cache_enabled else "understand"
+
+
+def route_after_cache_first(state: AgentState) -> str:
+    return "finalize" if state.get("cache_hit") else "understand"
 
 
 def route_after_understand(state: AgentState) -> str:
@@ -37,7 +64,7 @@ def route_after_understand(state: AgentState) -> str:
         return "execute" if state.get("plan") else "finalize"
     if not state.get("plan"):
         return "synthesize"
-    return "cache_lookup"
+    return "execute" if state.get("cache_checked") else "cache_lookup"
 
 
 def route_after_cache(state: AgentState) -> str:
@@ -76,6 +103,7 @@ def build_graph(
     checkpointer: BaseCheckpointSaver[Any] | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     g = StateGraph(AgentState)
+    g.add_node("cache_first", cache_first)
     g.add_node("understand", understand)
     g.add_node("cache_lookup", cache_lookup)
     g.add_node("execute", execute)
@@ -84,7 +112,8 @@ def build_graph(
     g.add_node("replan", replan)
     g.add_node("finalize", finalize)
 
-    g.add_edge(START, "understand")
+    g.add_conditional_edges(START, route_start, ["cache_first", "understand"])
+    g.add_conditional_edges("cache_first", route_after_cache_first, ["finalize", "understand"])
     g.add_conditional_edges(
         "understand", route_after_understand, ["finalize", "synthesize", "cache_lookup", "execute"]
     )

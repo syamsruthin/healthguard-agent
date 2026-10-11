@@ -124,6 +124,12 @@ def set_embedder(embedder: Embedder | None) -> None:
     _embedder = embedder
 
 
+def normalize_query(text: str) -> str:
+    """Lower-cased, whitespace-collapsed text: the semantic-cache key and memory-search query share it,
+    so one embedding (cached in Redis) serves both."""
+    return " ".join(text.lower().split())
+
+
 def _pack(vec: list[float]) -> str:
     return base64.b64encode(np.asarray(vec, dtype=np.float32).tobytes()).decode()
 

@@ -34,7 +34,7 @@ from backend.agents.tools.base import UserContext
 from backend.core.config import settings
 from backend.core.logging import get_logger
 from backend.core.telemetry import CACHE_EVENTS
-from backend.llm.embeddings import cosine, embed_query, get_embedder
+from backend.llm.embeddings import cosine, embed_query, get_embedder, normalize_query
 from backend.llm.prompts import PROMPT_VERSION
 
 log = get_logger(__name__)
@@ -44,6 +44,7 @@ log = get_logger(__name__)
 class CacheHit:
     payload: dict[str, Any]
     distance: float
+    scope: str = ""
 
 
 class SemanticCache(Protocol):
@@ -106,7 +107,7 @@ def lookup_key(state: dict[str, Any]) -> str:
     question depends on earlier turns.
     """
     if not state.get("recent_turns") and not state.get("summary"):
-        return " ".join(state.get("message", "").lower().split())
+        return normalize_query(state.get("message", ""))
     return state.get("standalone_query") or state.get("message", "")
 
 
@@ -222,7 +223,7 @@ class RedisSemanticCache:
         q = VectorQuery(
             vector=vector,
             vector_field_name="embedding",
-            return_fields=["body"],
+            return_fields=["body", "scope"],
             filter_expression=flt,
             num_results=1,
             return_score=True,
@@ -233,10 +234,12 @@ class RedisSemanticCache:
         distance = float(rows[0]["vector_distance"])
         if distance > settings.semantic_cache_distance_threshold:
             return None
-        payload = rows[0]["body"]
+        payload, scope = rows[0]["body"], rows[0].get("scope", "")
         if isinstance(payload, bytes):
             payload = payload.decode()
-        return CacheHit(payload=json.loads(payload), distance=distance)
+        if isinstance(scope, bytes):
+            scope = scope.decode()
+        return CacheHit(payload=json.loads(payload), distance=distance, scope=scope)
 
     async def store(
         self, query: str, payload: dict[str, Any], *, scope: str, data_version: int, ttl: int
@@ -288,7 +291,7 @@ class InMemorySemanticCache:
             if distance <= settings.semantic_cache_distance_threshold and (
                 best is None or distance < best.distance
             ):
-                best = CacheHit(payload=e["payload"], distance=distance)
+                best = CacheHit(payload=e["payload"], distance=distance, scope=e["scope"])
         return best
 
     async def store(

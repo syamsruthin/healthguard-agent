@@ -45,7 +45,8 @@ from backend.db.base import utcnow
 from backend.db.models import Conversation, LLMCall, Message, Trace, User
 from backend.db.session import SessionLocal, get_data_version
 from backend.llm.usage import UsageCollector, start_collection, stop_collection
-from backend.memory.context import build_context
+from backend.memory import long_term
+from backend.memory.context import MemoryContext, build_context
 from backend.services import conversation_service
 from backend.services.user_context import load_user_context
 from backend.workers.queue import get_enqueuer
@@ -227,15 +228,25 @@ async def _persist(
 
 
 async def _enqueue_followups(
-    prepared: PreparedTurn, final: dict[str, Any], user: User, assistant_id: uuid.UUID
+    prepared: PreparedTurn,
+    final: dict[str, Any],
+    user: User,
+    assistant_id: uuid.UUID,
+    memory: MemoryContext,
 ) -> None:
+    """Background work, each job only when it can do something (they cost model calls)."""
     q = get_enqueuer()
     cid = str(prepared.conversation_id)
     if prepared.first_turn:
         await q.enqueue("title_conversation", cid, job_id=f"title:{cid}")
-    await q.enqueue("summarize_conversation", cid, job_id=f"summarize:{cid}:{assistant_id}")
+    if memory.needs_summary_after(prepared.message, final.get("answer", "")):
+        await q.enqueue("summarize_conversation", cid, job_id=f"summarize:{cid}:{assistant_id}")
     outcome = final.get("outcome")
-    if user.memory_enabled and outcome in ("answered", "smalltalk"):
+    if (
+        user.memory_enabled
+        and outcome in ("answered", "smalltalk")
+        and long_term.worth_remembering(prepared.message)
+    ):
         await q.enqueue(
             "extract_memories",
             str(user.id),
@@ -264,6 +275,7 @@ async def execute_turn(prepared: PreparedTurn, sink: EventSink = _noop) -> dict[
     collector, token = start_collection()
     ctx: UserContext | None = None
     user: User | None = None
+    memory = MemoryContext()
     state: dict[str, Any] = {}
     try:
         async with SessionLocal() as session:
@@ -337,7 +349,7 @@ async def execute_turn(prepared: PreparedTurn, sink: EventSink = _noop) -> dict[
     if ctx is not None and user is not None:
         try:
             await maybe_store(final, ctx, source_message_id=str(assistant_id))
-            await _enqueue_followups(prepared, final, user, assistant_id)
+            await _enqueue_followups(prepared, final, user, assistant_id, memory)
         except Exception as exc:  # follow-ups never fail the turn
             log.warning("turn_followups_failed", error=str(exc)[:200])
     structlog.contextvars.unbind_contextvars("conversation_id", "trace_id")

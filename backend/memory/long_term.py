@@ -14,7 +14,7 @@ import re
 import uuid
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, exists, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.core.config import settings
@@ -52,6 +52,25 @@ _CLINICAL = re.compile(
 )
 
 
+# Durable preferences are stated by the user ("I prefer…", "I live in…", "a Spanish-speaking doctor",
+# "short answers"). Turns without such a cue skip the extraction call entirely.
+_PREFERENCE_CUE = re.compile(
+    r"\b(prefer\w*|rather|i (?:only|always|usually|never|like|want|need)|i'?d like|i would like|"
+    r"i live|we live|i(?:'m| am) (?:moving|based|located|from)|my (?:zip|home|address|city|town)|"
+    r"i speak|speak\w*|spanish|mandarin|cantonese|chinese|vietnamese|korean|tagalog|arabic|french|"
+    r"russian|hindi|portuguese|polish|creole|female|male|woman|man|"
+    r"short|brief|detailed|bullet\w*|tables?|"
+    r"telehealth|virtual|evenings?|weekends?|open enrollment|switch\w* plans?|compar\w+)\b",
+    re.IGNORECASE,
+)
+
+
+def worth_remembering(user_message: str) -> bool:
+    """Cheap gate before the extraction model call: does the message state a preference or a fact
+    about the user? False negatives only cost a memory; false positives cost one small call."""
+    return bool(_PREFERENCE_CUE.search(user_message))
+
+
 def is_storable(content: str) -> bool:
     """Deterministic backstop for the extraction prompt's privacy rules."""
     text = content.strip()
@@ -79,6 +98,10 @@ async def delete_memory(session: AsyncSession, user_id: uuid.UUID, memory_id: uu
 async def clear_memories(session: AsyncSession, user_id: uuid.UUID) -> None:
     await session.execute(delete(UserMemory).where(UserMemory.user_id == user_id))
     await session.commit()
+
+
+async def has_memories(session: AsyncSession, user_id: uuid.UUID) -> bool:
+    return bool((await session.execute(select(exists().where(UserMemory.user_id == user_id)))).scalar())
 
 
 async def search(session: AsyncSession, user_id: uuid.UUID, query_embedding: list[float]) -> list[UserMemory]:

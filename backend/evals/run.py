@@ -249,6 +249,7 @@ async def _execute(
 
         rows = await asyncio.gather(*(one(c) for c in cases))
         summary = _summarize(rows, len(judges) if use_ragas else 0)
+        summary["judge_cost_usd"] = judge_cost(jury)
         passed, thresholds, failures = _gate(summary["metrics"])
         summary.update(thresholds=thresholds, gate_failures=failures)
         await _store(run_id, rows, len(judges) if use_ragas else 0)
@@ -268,6 +269,12 @@ async def _execute(
                 run.status, run.error, run.finished_at = "failed", str(exc)[:2000], utcnow()
                 await session.commit()
         raise
+
+
+def judge_cost(jury: Any) -> float:
+    """USD the jury's judge calls cost in this process (cached judge responses are free)."""
+    spend = getattr(jury, "spend", None)
+    return round(spend.cost_usd, 4) if spend is not None else 0.0
 
 
 def flag_disagreement(scores: dict[str, Any], n_judges: int) -> bool:
@@ -419,6 +426,7 @@ async def rescore(
 
     rows = await asyncio.gather(*(one(r) for r in stored))
     summary = _summarize(rows, len(judges))
+    summary["judge_cost_usd"] = judge_cost(jury)
     passed, thresholds, failures = _gate(summary["metrics"])
     summary.update(thresholds=thresholds, gate_failures=failures)
     await _store(run_id, rows, len(judges))
@@ -483,7 +491,18 @@ def _print_outcome(outcome: dict[str, Any]) -> int:
     s = outcome["summary"]
     print(
         json.dumps(
-            {k: s[k] for k in ("cases", "errors", "metrics", "cost_usd", "latency_p50_ms", "latency_p95_ms")},
+            {
+                k: s.get(k)
+                for k in (
+                    "cases",
+                    "errors",
+                    "metrics",
+                    "cost_usd",
+                    "judge_cost_usd",
+                    "latency_p50_ms",
+                    "latency_p95_ms",
+                )
+            },
             indent=2,
         )
     )

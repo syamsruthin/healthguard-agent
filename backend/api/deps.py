@@ -60,3 +60,9 @@ def auth_rate_limit(bucket: str) -> Callable[[Request], Awaitable[None]]:
 
 async def chat_rate_limit(user: User = Depends(get_current_user)) -> None:
     await rate_limit.hit(f"chat:{user.id}", settings.rate_limit_chat_per_minute)
+    if user.role != "admin":
+        await rate_limit.daily_hit(f"turns:{user.id}", settings.daily_turn_limit)
+
+
+async def feedback_rate_limit(user: User = Depends(get_current_user)) -> None:
+    await rate_limit.hit(f"feedback:{user.id}", settings.rate_limit_feedback_per_minute)

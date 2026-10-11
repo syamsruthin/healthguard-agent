@@ -14,12 +14,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.core.config import settings
 from backend.core.logging import get_logger
-from backend.core.tokens import count_tokens
 from backend.db.models import Conversation
 from backend.llm.client import get_llm
 from backend.llm.prompts.memory import build_summary_messages
 from backend.llm.registry import Role
-from backend.memory.context import format_turn, history_messages, split_window
+from backend.memory.context import format_turn, history_messages, needs_summary, split_window
 
 log = get_logger(__name__)
 
@@ -31,9 +30,9 @@ async def maybe_summarize(session: AsyncSession, conversation_id: uuid.UUID) -> 
         return False
     msgs = await history_messages(session, conversation)
     lines = [format_turn(m.role, m.content) for m in msgs]
-    older, _ = split_window(lines, settings.history_token_budget)
-    if not older or count_tokens("\n".join(older)) < settings.summary_trigger_tokens:
+    if not needs_summary(lines):
         return False
+    older, _ = split_window(lines, settings.history_token_budget)
     result = await get_llm().complete(
         Role.FAST,
         build_summary_messages(previous_summary=conversation.summary or "", transcript="\n".join(older)),

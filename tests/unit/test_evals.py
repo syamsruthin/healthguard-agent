@@ -146,3 +146,33 @@ def test_follow_ups_are_judged_against_the_resolved_question() -> None:
     assert judged_question(follow_up, result) == result["standalone_query"]
     assert judged_question(first_turn, result) == "What is my deductible?"
     assert judged_question(follow_up, {}) == follow_up["question"]
+
+
+async def test_spend_meter_sums_reported_judge_cost() -> None:
+    import importlib
+    import json as _json
+
+    from openai import DefaultAsyncHttpxClient
+
+    # Whichever httpx distribution the SDK is built on (httpx or httpx2).
+    sdk_httpx = importlib.import_module(DefaultAsyncHttpxClient.__mro__[1].__module__.split(".")[0])
+
+    from backend.evals.ragas_jury import SpendMeter
+    from backend.evals.run import judge_cost
+
+    replies = iter([{"usage": {"cost": 0.0021}}, {"usage": {"cost": 0.0004}}, {"error": "x"}])
+
+    def handler(request):  # type: ignore[no-untyped-def]
+        body = next(replies)
+        return sdk_httpx.Response(200 if "usage" in body else 500, json=body)
+
+    meter = SpendMeter()
+    client = DefaultAsyncHttpxClient(
+        transport=sdk_httpx.MockTransport(handler), event_hooks={"response": [meter.on_response]}
+    )
+    for _ in range(3):
+        response = await client.post("https://openrouter.test/v1/chat/completions", json={})
+        assert _json.loads(response.content)  # the hook read the body; the caller can still parse it
+    await client.aclose()
+    assert meter.calls == 2 and round(meter.cost_usd, 6) == 0.0025
+    assert judge_cost(SimpleNamespace(spend=meter)) == 0.0025 and judge_cost(None) == 0.0

@@ -11,7 +11,7 @@ Conversation context for a turn.
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -20,8 +20,8 @@ from backend.core.config import settings
 from backend.core.logging import get_logger
 from backend.core.tokens import count_tokens
 from backend.db.models import Conversation, Message, User
-from backend.llm.embeddings import embed_query
-from backend.memory.long_term import format_memories, search
+from backend.llm.embeddings import embed_query, normalize_query
+from backend.memory.long_term import format_memories, has_memories, search
 
 log = get_logger(__name__)
 
@@ -33,6 +33,13 @@ class MemoryContext:
     recent_turns: str = ""
     summary: str = ""
     memories: str = ""
+    lines: list[str] = field(default_factory=list)  # every unsummarised turn, chronological
+
+    def needs_summary_after(self, user_message: str, answer: str) -> bool:
+        """Whether this turn pushes enough history out of the window for a summary job to have work."""
+        return needs_summary(
+            [*self.lines, format_turn("user", user_message), format_turn("assistant", answer)]
+        )
 
 
 def format_turn(role: str, content: str) -> str:
@@ -53,6 +60,12 @@ def split_window(lines: list[str], budget: int) -> tuple[list[str], list[str]]:
         used += cost
         start = i
     return lines[:start], lines[start:]
+
+
+def needs_summary(lines: list[str]) -> bool:
+    """True when the turns outside the history window reach SUMMARY_TRIGGER_TOKENS."""
+    older, _ = split_window(lines, settings.history_token_budget)
+    return bool(older) and count_tokens("\n".join(older)) >= settings.summary_trigger_tokens
 
 
 async def history_messages(
@@ -82,9 +95,11 @@ async def build_context(
     memories = ""
     if user.memory_enabled:
         try:
-            memories = format_memories(await search(session, user.id, await embed_query(message)))
+            if await has_memories(session, user.id):  # no embedding call for users with nothing stored
+                vector = await embed_query(normalize_query(message))  # same text as the cache key
+                memories = format_memories(await search(session, user.id, vector))
         except Exception as exc:  # memory is an enhancement; never fail the turn for it
             log.warning("memory_search_failed", error=str(exc)[:200])
     return MemoryContext(
-        recent_turns="\n".join(window), summary=conversation.summary or "", memories=memories
+        recent_turns="\n".join(window), summary=conversation.summary or "", memories=memories, lines=lines
     )

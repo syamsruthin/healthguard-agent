@@ -76,8 +76,46 @@ async def test_streamed_turn_contract_and_persistence(client, fake_llm, jobs) ->
             )
         ).scalar_one()
         assert calls >= 4  # understand, sql, synthesize, verify
-    assert {"title_conversation", "summarize_conversation", "extract_memories"} <= set(jobs.names())
+    # Background jobs run only when they have work: a short first turn with no stated preference
+    # needs a title but no summary and no memory extraction.
+    assert set(jobs.names()) == {"title_conversation"}
     assert not await get_redis().exists(f"hg:turn:{cid}")  # lock released
+
+
+async def test_stated_preferences_queue_memory_extraction(client, fake_llm, jobs) -> None:
+    fake_llm(script())
+    tokens = await login(client, "maria.garcia@demo.healthguard.dev")
+    cid = await _conversation(client, tokens)
+    await client.post(
+        f"{API}/conversations/{cid}/messages",
+        json={"message": "I prefer Spanish-speaking doctors. Why was my claim denied?"},
+        headers=auth(tokens),
+    )
+    assert "extract_memories" in jobs.names()
+
+
+async def test_daily_turn_limit_applies_to_members_only(client, fake_llm, monkeypatch) -> None:
+    from backend.core.config import settings
+
+    fake_llm(script())
+    monkeypatch.setattr(settings, "daily_turn_limit", 1)
+    redis = get_redis()
+    async for key in redis.scan_iter(match="hg:daily:*"):
+        await redis.delete(key)
+    member = await login(client, "maria.garcia@demo.healthguard.dev")
+    cid = await _conversation(client, member)
+    url = f"{API}/conversations/{cid}/messages"
+    assert (await client.post(url, json={"message": "hello"}, headers=auth(member))).status_code == 200
+    blocked = await client.post(url, json={"message": "hello again"}, headers=auth(member))
+    assert blocked.status_code == 429 and blocked.json()["error"]["code"] == "daily_limit"
+    assert int(blocked.headers["retry-after"]) > 0
+    admin = await login(client, "admin@demo.healthguard.dev")
+    admin_cid = await _conversation(client, admin)
+    for _ in range(2):
+        resp = await client.post(
+            f"{API}/conversations/{admin_cid}/messages", json={"message": "hello"}, headers=auth(admin)
+        )
+        assert resp.status_code == 200
 
 
 async def test_rls_applies_to_generated_sql(client, fake_llm) -> None:
@@ -237,6 +275,8 @@ async def test_admin_can_queue_an_eval_run(client, jobs) -> None:
     assert ("run_offline_eval", (run_id, 5), f"eval:{run_id}") in jobs.jobs
     runs = (await client.get(f"{API}/admin/evals/runs", headers=auth(admin))).json()
     assert runs[0]["id"] == run_id and runs[0]["status"] == "queued"
+    second = await client.post(f"{API}/admin/evals/run", json={"limit": 5}, headers=auth(admin))
+    assert second.status_code == 409 and second.json()["error"]["code"] == "eval_in_progress"
     async with SessionLocal() as session:
         await session.delete(await session.get(EvalRun, uuid.UUID(run_id)))
         await session.commit()

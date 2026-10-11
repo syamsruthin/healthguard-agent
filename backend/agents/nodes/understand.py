@@ -10,6 +10,7 @@ from backend.agents.planning import sanitize_plan
 from backend.agents.state import AgentState
 from backend.agents.tools.base import UserContext
 from backend.agents.trace import append, emit, step, traced
+from backend.cache.semantic import cache_scope
 from backend.core.config import settings
 from backend.core.logging import get_logger
 from backend.core.telemetry import GUARDRAIL_BLOCKS
@@ -97,6 +98,8 @@ async def understand(state: AgentState) -> dict[str, Any]:
     if not replans:
         update["standalone_query"] = u.standalone_query.strip() or message
         update["needs_member_data"] = u.needs_member_data
+        # Where a verified answer to this turn may be stored (None: not cacheable for this account).
+        update["cache_scope"] = cache_scope(user, u.needs_member_data) or ""
         if not plan:
             update["outcome"] = "smalltalk"
     if plan:

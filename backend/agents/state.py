@@ -39,6 +39,7 @@ class AgentState(TypedDict, total=False):
     fallback: str  # FALLBACKS key used for the final answer, if any
     block_reason: str
     cache_hit: bool
+    cache_checked: bool  # the semantic cache was already consulted before planning
     cache_scope: str
     cache_query: str  # text the semantic cache was keyed on
     trace: list[dict[str, Any]]
@@ -83,6 +84,7 @@ def initial_state(
         fallback="",
         block_reason="",
         cache_hit=False,
+        cache_checked=False,
         cache_scope="",
         cache_query="",
         trace=[],

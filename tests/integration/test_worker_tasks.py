@@ -142,3 +142,6 @@ async def test_online_eval_jury(convo, fake_llm, monkeypatch: pytest.MonkeyPatch
     by_metric = {r.metric: r for r in rows}
     assert by_metric["faithfulness"].spread == pytest.approx(0.4)
     assert set(by_metric["faithfulness"].judge_scores) == {"openai/judge-a", "google/judge-b"}
+    calls = len(llm.calls)
+    assert await tasks.online_eval({}, str(convo["answer"]), "thumbs_down") is None  # judged once only
+    assert len(llm.calls) == calls

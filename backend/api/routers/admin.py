@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, status
@@ -9,7 +10,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import require_admin
-from backend.core.errors import NotFoundError
+from backend.core.errors import ConflictError, NotFoundError
+from backend.db.base import utcnow
 from backend.db.models import EvalRun, Trace, User
 from backend.db.session import get_session
 from backend.services import metrics_service
@@ -44,10 +46,22 @@ class EvalRunIn(BaseModel):
     limit: int | None = Field(default=10, ge=1, le=500, description="Golden cases to run (None = all)")
 
 
+# A run that has been "running" longer than the worker's job timeout died with its worker.
+_EVAL_RUN_MAX_AGE = timedelta(hours=3)
+
+
 @router.post("/evals/run", status_code=status.HTTP_202_ACCEPTED)
 async def start_eval(
     body: EvalRunIn, admin: User = Depends(require_admin), session: AsyncSession = Depends(get_session)
 ) -> dict[str, Any]:
+    """Queue a golden-suite run; only one paid run at a time."""
+    active = await session.execute(
+        select(EvalRun.id).where(
+            EvalRun.status.in_(("queued", "running")), EvalRun.started_at >= utcnow() - _EVAL_RUN_MAX_AGE
+        )
+    )
+    if active.first() is not None:
+        raise ConflictError("An evaluation run is already in progress", code="eval_in_progress")
     run = EvalRun(suite="golden", status="queued", config={"limit": body.limit}, triggered_by=admin.id)
     session.add(run)
     await session.commit()

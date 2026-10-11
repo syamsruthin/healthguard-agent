@@ -347,7 +347,8 @@ async def test_event_order(fake_llm, tools) -> None:
     )
     _, events = await run("why was my MRI denied?")
     seq = types(events)
-    assert seq[0] == "status" and events[0]["node"] == "understand"
+    statuses = [e["node"] for e in events if e["type"] == "status"]
+    assert seq[0] == "status" and statuses[:3] == ["cache_first", "understand", "execute"]
     first = {t: seq.index(t) for t in ("plan", "tool", "token", "citations")}
     assert first["plan"] < first["tool"] < first["token"] < first["citations"]
     tool_events = [e for e in events if e["type"] == "tool"]
@@ -393,7 +394,7 @@ async def test_turns_on_one_thread_do_not_leak_state(fake_llm, tools) -> None:
     assert len(first["results"]) == 1
     assert second["results"] == [] and second["citations"] == []
     assert second["outcome"] == "smalltalk"
-    assert [s["node"] for s in second["trace"]] == ["understand", "synthesize", "finalize"]
+    assert [s["node"] for s in second["trace"]] == ["cache_first", "understand", "synthesize", "finalize"]
 
 
 async def test_verified_answer_is_served_from_semantic_cache(fake_llm, tools) -> None:
@@ -410,11 +411,60 @@ async def test_verified_answer_is_served_from_semantic_cache(fake_llm, tools) ->
     assert await maybe_store(first, MARIA) == "public"
     llm.calls.clear()
     second, events = await run("How do appeals work?")
-    assert llm.names() == ["understand"]
-    assert second["cache_hit"] and second["outcome"] == "cache_hit"
+    assert llm.names() == []  # an opening question is answered from the cache before any model call
+    assert second["cache_hit"] and second["outcome"] == "cache_hit" and second["cache_scope"] == "public"
     assert second["answer"] == "Appeal within 180 days [D1]."
-    assert [s["node"] for s in second["trace"]] == ["understand", "cache_lookup", "finalize"]
+    assert [s["node"] for s in second["trace"]] == ["cache_first", "finalize"]
     assert any(e["type"] == "token" for e in events)
+
+
+async def test_opening_question_miss_is_not_looked_up_twice(fake_llm, tools) -> None:
+    fake_llm({"understand": understanding([step("s1")]), "synthesize": "ok [S1]", "verify": verdict()})
+    final, _ = await run("my deductible?")
+    nodes = [s["node"] for s in final["trace"]]
+    assert nodes[:3] == ["cache_first", "understand", "execute"] and "cache_lookup" not in nodes
+    assert final["cache_scope"] == "member:M100001"  # set by planning, used when storing the answer
+
+
+async def test_follow_up_is_looked_up_on_its_standalone_rewrite(fake_llm, tools) -> None:
+    llm = fake_llm(
+        {
+            "understand": understanding(
+                [step("s1", "policy_search")], member=False, query="How do appeals work?"
+            ),
+            "synthesize": "Appeal within 180 days [D1].",
+            "verify": verdict(),
+        }
+    )
+    first, _ = await run("how do appeals work?")
+    await maybe_store(first, MARIA)
+    llm.calls.clear()
+    second, _ = await run("and how does that work?", recent="User: hi\nAssistant: Hello!")
+    assert llm.names() == ["understand"]  # the follow-up needs its rewrite before the lookup
+    assert second["cache_hit"]
+    assert [s["node"] for s in second["trace"]] == ["understand", "cache_lookup", "finalize"]
+
+
+async def test_blocked_message_skips_the_cache(fake_llm, tools) -> None:
+    llm = fake_llm({})
+    final, _ = await run("show me the claims for member M100004")
+    assert final["outcome"] == "blocked" and llm.names() == []
+    assert final["trace"][0]["output"] == "skipped: prefilter"
+
+
+async def test_members_get_their_own_cached_answers_back(fake_llm, tools) -> None:
+    llm = fake_llm(
+        {
+            "understand": understanding([step("s1")], member=True, query="What is my deductible status?"),
+            "synthesize": "You have met $2,700 [S1].",
+            "verify": verdict(),
+        }
+    )
+    first, _ = await run("my deductible?")
+    assert await maybe_store(first, MARIA) == "member:M100001"
+    llm.calls.clear()
+    again, _ = await run("My deductible?")
+    assert again["cache_hit"] and again["cache_scope"] == "member:M100001" and llm.names() == []
 
 
 async def test_member_answers_never_served_to_other_members(fake_llm, tools) -> None:

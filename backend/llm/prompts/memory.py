@@ -6,6 +6,8 @@ import json
 
 from backend.llm.prompts.schemas import MemoryExtraction, Title
 
+ASSISTANT_EXCERPT_CHARS = 800  # preferences come from the user; the reply only gives context
+
 _MEMORY_STATIC = f"""You maintain long-term memory for a health-insurance assistant. From the latest exchange, extract DURABLE facts or preferences about the user that would help in future conversations.
 
 Keep (examples):
@@ -33,7 +35,7 @@ def build_memory_messages(*, existing: str, user_message: str, assistant_message
             "role": "user",
             "content": (
                 f"<existing_memories>\n{existing or '(none)'}\n</existing_memories>\n\n"
-                f"<user>\n{user_message}\n</user>\n\n<assistant>\n{assistant_message[:3000]}\n</assistant>"
+                f"<user>\n{user_message}\n</user>\n\n<assistant>\n{assistant_message[:ASSISTANT_EXCERPT_CHARS]}\n</assistant>"
             ),
         },
     ]

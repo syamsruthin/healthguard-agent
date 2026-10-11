@@ -64,6 +64,9 @@ class Settings(BaseSettings):
     # ── Rate limits (per minute) ────────────────────────────────────────
     rate_limit_chat_per_minute: int = 20
     rate_limit_auth_per_minute: int = 10
+    rate_limit_feedback_per_minute: int = 30
+    # Turns per member account per UTC day (0 = unlimited); admins are exempt. Caps spend from open registration.
+    daily_turn_limit: int = 150
 
     # ── LLM gateway (OpenRouter, OpenAI-compatible) ─────────────────────
     openrouter_api_key: str = ""
@@ -101,7 +104,7 @@ class Settings(BaseSettings):
     online_eval_judges: CsvList = Field(
         default_factory=lambda: ["openai/gpt-5.4-mini", "google/gemini-3.8-flash"]
     )
-    online_eval_sample_rate: float = 0.25
+    online_eval_sample_rate: float = 0.05  # share of answered turns judged live (every thumbs-down is judged)
     judge_disagreement_threshold: float = 0.3
 
     # ── Embeddings ───────────────────────────────────────────────────────

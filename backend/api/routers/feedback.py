@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, status
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.api.deps import get_current_user
+from backend.api.deps import feedback_rate_limit, get_current_user
 from backend.api.schemas import FeedbackIn
 from backend.core.errors import NotFoundError
 from backend.db.models import Feedback, Message, User
@@ -16,7 +16,11 @@ from backend.workers.queue import get_enqueuer
 router = APIRouter(prefix="/messages", tags=["feedback"])
 
 
-@router.post("/{message_id}/feedback", status_code=status.HTTP_204_NO_CONTENT)
+@router.post(
+    "/{message_id}/feedback",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(feedback_rate_limit)],
+)
 async def give_feedback(
     message_id: uuid.UUID,
     body: FeedbackIn,

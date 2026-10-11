@@ -4,7 +4,8 @@ RAGAS scoring with a jury of judges from different model families.
 Every metric is scored once per judge (EVAL_JUDGES, via OpenRouter); the case
 score is the mean over the judges that succeeded, and the spread (max − min)
 flags disagreement. Judge responses are cached on disk, so re-running
-unchanged cases costs nothing.
+unchanged cases costs nothing. RAGAS calls OpenRouter with its own client, so
+a response hook (`SpendMeter`) adds up the cost OpenRouter reports per call.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 from ragas.cache import DiskCacheBackend
 from ragas.embeddings import OpenAIEmbeddings
 from ragas.llms import llm_factory
@@ -43,6 +44,27 @@ CACHE_DIR = Path(__file__).parent / ".cache"
 JUDGE_MAX_TOKENS = 8192  # long answers produce long claim lists (4,096 still truncated 2 of 21 calls)
 
 
+class SpendMeter:
+    """Sums `usage.cost` from every judge response (OpenRouter includes it on each call)."""
+
+    def __init__(self) -> None:
+        self.cost_usd = 0.0
+        self.calls = 0
+
+    async def on_response(self, response: Any) -> None:  # the SDK's httpx response
+        if response.request.method != "POST" or response.status_code != 200:
+            return
+        if "text/event-stream" in response.headers.get("content-type", ""):
+            return
+        await response.aread()  # httpx keeps the body, so the SDK can still parse it
+        try:
+            usage = response.json().get("usage") or {}
+        except ValueError:
+            return
+        self.calls += 1
+        self.cost_usd += float(usage.get("cost") or 0.0)
+
+
 class Jury:
     def __init__(self, judges: list[str], metrics: tuple[str, ...] = CORE_METRICS, concurrency: int = 4):
         unknown = set(metrics) - set(ALL_METRICS)
@@ -51,12 +73,14 @@ class Jury:
         self.judges = judges
         self.metrics = metrics
         self._sem = asyncio.Semaphore(concurrency)
+        self.spend = SpendMeter()
         client = AsyncOpenAI(
             api_key=settings.openrouter_api_key or "not-configured",
             base_url=settings.llm_base_url,
             timeout=settings.llm_timeout_seconds,
             max_retries=settings.llm_max_retries,
             default_headers={"HTTP-Referer": settings.openrouter_app_url, "X-Title": "HealthGuard evals"},
+            http_client=DefaultAsyncHttpxClient(event_hooks={"response": [self.spend.on_response]}),
         )
         embeddings = OpenAIEmbeddings(client=client, model=settings.embedding_model)
         self._scorers: dict[str, dict[str, Any]] = {}
