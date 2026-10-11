@@ -34,7 +34,7 @@ from backend.core.logging import get_logger
 from backend.core.telemetry import LLM_ERRORS, end_llm_span, start_span
 from backend.llm import cache as llm_cache
 from backend.llm.prompts import PROMPT_VERSION
-from backend.llm.registry import ModelSpec, Role, spec_for, supports_cache_control
+from backend.llm.registry import ModelSpec, Role, is_router, spec_for, supports_cache_control
 from backend.llm.usage import LLMCallRecord, parse_usage, record
 
 log = get_logger(__name__)
@@ -277,11 +277,14 @@ class OpenRouterClient:
                     ),
                 },
             ]
+            # A router may keep choosing a model that ignores the schema; repair with a fixed fallback model.
+            spec = spec_for(role, model)
+            repair_model = spec.fallbacks[0] if is_router(spec.model) and spec.fallbacks else model
             fixed = await self.complete(
                 role,
                 repair,
                 name=f"{name}.repair",
-                model=model,
+                model=repair_model,
                 max_tokens=max_tokens,
                 use_cache=False,
                 response_format=response_format,

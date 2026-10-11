@@ -81,7 +81,7 @@ HealthGuard:   Your April 6, 2026 knee MRI at Austin Imaging Center (claim CLM-2
 - A background worker (arq) for titles, rolling summaries, long-term memories and online answer scoring.
 
 **Cost and quality**
-- Per-role models through OpenRouter, with fallback routing.
+- Per-role models through OpenRouter, defaulting to the cost-optimising Jev Router with fixed-model fallbacks.
 - Four cache layers:
   - provider prompt caching,
   - a user-scoped semantic answer cache,
@@ -370,12 +370,14 @@ Settings are read from environment variables (or `.env`) by `backend/core/config
 |---|---|---|
 | `OPENROUTER_API_KEY` | — | Required for real answers |
 | `LLM_BASE_URL` | `https://openrouter.ai/api/v1` | Any OpenAI-compatible endpoint works |
-| `MODEL_FAST` (+ `_FALLBACKS`) | `anthropic/claude-haiku-5.5` | Understanding and planning, verification, memory, titles, summaries |
-| `MODEL_CODE` (+ `_FALLBACKS`) | `anthropic/claude-sonnet-5.5` | SQL and pandas generation |
-| `MODEL_SYNTH` (+ `_FALLBACKS`) | `anthropic/claude-sonnet-5.5` | The streamed answer |
+| `MODEL_FAST` (+ `_FALLBACKS`) | `typesafe/jev-router` (fallbacks: Claude Haiku 5.5, Gemini 3.8 Flash) | Understanding and planning, verification, memory, titles, summaries |
+| `MODEL_CODE` (+ `_FALLBACKS`) | `typesafe/jev-router` (fallbacks: Claude Sonnet 5.5, GPT-5.4 mini) | SQL and pandas generation |
+| `MODEL_SYNTH` (+ `_FALLBACKS`) | `typesafe/jev-router` (fallbacks: Claude Sonnet 5.5, Gemini 3.8 Flash) | The streamed answer |
 | `EVAL_JUDGES` | `openai/gpt-5.4-mini, google/gemini-3.8-flash, anthropic/claude-haiku-5.5` | Offline RAGAS jury |
 | `ONLINE_EVAL_JUDGES` / `ONLINE_EVAL_SAMPLE_RATE` | GPT + Gemini / `0.25` | Live answer scoring |
 | `EMBEDDING_PROVIDER` / `EMBEDDING_MODEL` / `EMBEDDING_DIM` | `openrouter` / `openai/text-embedding-3-small` / `1536` | `local` uses sentence-transformers (`uv sync --extra local-embeddings`); `hash` is for tests only |
+
+`typesafe/jev-router` is TypeSafe's Jev Router on OpenRouter. It picks the model and reasoning effort for each request and bills at the price of the model that serves it, which makes it the cost-efficient default. Router-served calls get a 4,096-token output budget, because the reasoning tokens it may spend count against `max_tokens`. A structured-output repair goes to the first fixed fallback model. The judge juries stay on fixed models from different families, since a router could send every judge to the same model.
 
 **Agent behaviour, memory and caching**
 
@@ -447,7 +449,7 @@ Defence in depth, from the request down to the data:
 | **Exact LLM cache** | Byte-identical temperature-0 calls | Keyed on model, messages and prompt version |
 | **Embedding cache** | Query embeddings (7 days) | — |
 
-Measured on the live demo:
+Measured on the live demo. The first five rows used fixed Claude models; the last row is the Jev Router default:
 
 | Measurement | Result |
 |---|---|
@@ -456,6 +458,7 @@ Measured on the live demo:
 | Typical turn | $0.01–0.04; about 10 s average, 27 s p95 |
 | A second member asking a general question already in the semantic cache | $0.0002 instead of about $0.01 |
 | An out-of-scope question | blocked for $0.0002 |
+| The same MRI-denial turn on the Jev Router default | $0.009–0.017, vs $0.023–0.039 on fixed Claude models; the router picked DeepSeek V4.1 Flash and Gemini 3.8 Flash |
 
 ---
 

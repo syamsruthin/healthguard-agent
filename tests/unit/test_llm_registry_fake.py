@@ -5,7 +5,7 @@ from pydantic import BaseModel
 
 from backend.core.config import settings
 from backend.llm.client import LLMError
-from backend.llm.registry import Role, spec_for, supports_cache_control
+from backend.llm.registry import Role, is_router, spec_for, supports_cache_control
 
 
 def test_spec_for_accepts_plain_strings() -> None:
@@ -19,7 +19,21 @@ def test_spec_for_accepts_plain_strings() -> None:
 def test_cache_control_support() -> None:
     assert supports_cache_control("anthropic/claude-haiku-5.5")
     assert supports_cache_control("google/gemini-3.8-flash")
+    assert supports_cache_control("typesafe/jev-router")  # may route to Anthropic / Gemini
     assert not supports_cache_control("openai/gpt-5.4-mini")
+
+
+def test_router_calls_get_a_larger_output_budget() -> None:
+    assert spec_for("fast").max_tokens >= 4096  # router default
+    assert spec_for("fast", model="anthropic/claude-haiku-5.5").max_tokens == 1200
+
+
+def test_router_is_default_but_judges_stay_fixed() -> None:
+    assert (
+        spec_for("fast").model == spec_for("code").model == spec_for("synth").model == "typesafe/jev-router"
+    )
+    assert spec_for("fast").fallbacks  # a router outage degrades to fixed models
+    assert not any(is_router(j) for j in settings.eval_judges + settings.online_eval_judges)
 
 
 class _Out(BaseModel):

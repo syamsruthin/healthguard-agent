@@ -167,3 +167,12 @@ async def test_stream_yields_text_and_records_final_usage(client) -> None:
     assert text == "Hello world"
     assert sent[0]["stream"] is True and sent[0]["stream_options"] == {"include_usage": True}
     assert collector.calls[0].cached_tokens == 2600
+
+
+async def test_router_structured_repair_uses_a_fixed_fallback_model(client) -> None:
+    replies = iter([_completion("We need to think about this... (no JSON)"), _completion('{"answer": "ok"}')])
+    c, sent = client(lambda r: httpx.Response(200, json=next(replies)))
+    out = await c.structured(Role.FAST, MESSAGES, _Out, name="verify", use_cache=False)
+    assert out.answer == "ok"
+    assert sent[0]["model"] == settings.model_fast == "typesafe/jev-router"
+    assert sent[1]["model"] == settings.model_fast_fallbacks[0]  # the repair does not go back to the router

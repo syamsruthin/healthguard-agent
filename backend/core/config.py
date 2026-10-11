@@ -73,18 +73,24 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 60.0
     llm_max_retries: int = 3
 
-    # Per-role model registry (balanced tiers). Fallbacks use OpenRouter's
-    # `models` routing so a provider outage degrades gracefully.
-    model_fast: str = "anthropic/claude-haiku-5.5"
+    # Per-role model registry. Every role defaults to the TypeSafe Jev Router, which picks the model and
+    # reasoning effort per request and bills at the serving model's price (the cost-efficient option).
+    # Fallbacks use OpenRouter's `models` routing, so a router or provider outage degrades to fixed models.
+    model_fast: str = "typesafe/jev-router"
     model_fast_fallbacks: CsvList = Field(
-        default_factory=lambda: ["google/gemini-3.8-flash", "openai/gpt-5.4-mini"]
+        default_factory=lambda: ["anthropic/claude-haiku-5.5", "google/gemini-3.8-flash"]
     )
-    model_code: str = "anthropic/claude-sonnet-5.5"
-    model_code_fallbacks: CsvList = Field(default_factory=lambda: ["openai/gpt-5.4-mini"])
-    model_synth: str = "anthropic/claude-sonnet-5.5"
-    model_synth_fallbacks: CsvList = Field(default_factory=lambda: ["google/gemini-3.8-flash"])
+    model_code: str = "typesafe/jev-router"
+    model_code_fallbacks: CsvList = Field(
+        default_factory=lambda: ["anthropic/claude-sonnet-5.5", "openai/gpt-5.4-mini"]
+    )
+    model_synth: str = "typesafe/jev-router"
+    model_synth_fallbacks: CsvList = Field(
+        default_factory=lambda: ["anthropic/claude-sonnet-5.5", "google/gemini-3.8-flash"]
+    )
 
-    # Judge ensembles ("jury") — different model families reduce self-preference bias.
+    # Judge ensembles ("jury") — different model families reduce self-preference bias. These stay fixed
+    # models on purpose: a router could send every judge to the same model and the jury would lose its point.
     eval_judges: CsvList = Field(
         default_factory=lambda: [
             "openai/gpt-5.4-mini",
