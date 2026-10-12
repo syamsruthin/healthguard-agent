@@ -190,8 +190,8 @@ flowchart TD
 ### Option A: local development
 
 ```bash
-git clone https://github.com/syamsruthin/provider-agnostic-rag-agent.git
-cd provider-agnostic-rag-agent
+git clone https://github.com/syamsruthin/healthguard-agent.git
+cd healthguard-agent
 cp .env.example .env
 ```
 
