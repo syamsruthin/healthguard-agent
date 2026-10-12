@@ -71,7 +71,7 @@ class Settings(BaseSettings):
     # ── LLM gateway (OpenRouter, OpenAI-compatible) ─────────────────────
     openrouter_api_key: str = ""
     llm_base_url: str = "https://openrouter.ai/api/v1"
-    openrouter_app_url: str = "https://github.com/syamsruthin/provider-agnostic-rag-agent"
+    openrouter_app_url: str = "https://github.com/syamsruthin/healthguard-agent"
     openrouter_app_title: str = "HealthGuard Agentic RAG"
     llm_timeout_seconds: float = 60.0
     llm_max_retries: int = 3
