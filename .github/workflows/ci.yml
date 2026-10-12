@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: healthguard
+          POSTGRES_PASSWORD: healthguard
+          POSTGRES_DB: healthguard
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U healthguard" --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:8
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      ENV: test
+      DATABASE_URL: postgresql+asyncpg://healthguard:healthguard@localhost:5432/healthguard
+      REDIS_URL: redis://localhost:6379/0
+      EMBEDDING_PROVIDER: hash
+      JWT_SECRET: ci-only-secret-value-that-is-long-enough-123
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups --frozen
+      - name: Lint
+        run: uv run ruff check backend frontend tests
+      - name: Format check
+        run: uv run ruff format --check backend frontend tests
+      - name: Type check
+        run: uv run mypy backend
+      - name: Unit tests
+        run: uv run pytest -m "not integration and not live" --cov --cov-report=
+      - name: Migrate + seed (small) + ingest
+        run: |
+          uv run alembic upgrade head
+          uv run hg-seed --scale small
+          uv run hg-ingest
+      - name: Integration tests (+ combined coverage gate)
+        run: uv run pytest -m integration --cov --cov-append --cov-report=term-missing:skip-covered --cov-fail-under=78
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: false
+          tags: healthguard:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

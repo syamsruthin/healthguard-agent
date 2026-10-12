@@ -1,108 +1,217 @@
 """
-Centralized configuration for the HealthGuard backend.
-All paths, model settings, and environment variables in one place.
+Centralized, environment-driven configuration (pydantic-settings).
+
+Every tunable lives here: infrastructure URLs, auth, the per-role OpenRouter
+model registry, caching, memory budgets, guardrail limits and eval settings.
+Values come from environment variables (or `.env`), so the same image runs
+in dev, CI and production.
 """
 
-import os
+from __future__ import annotations
+
+from functools import lru_cache
 from pathlib import Path
+from typing import Annotated, Literal
 
-from dotenv import load_dotenv
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
-load_dotenv()
-
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
 BACKEND_DIR = Path(__file__).resolve().parent.parent  # backend/
-DATA_DIR = BACKEND_DIR / "data"
-DOCS_DIR = DATA_DIR / "docs"
-LOGS_DIR = BACKEND_DIR / "logs"
+PROJECT_DIR = BACKEND_DIR.parent
 
-DB_PATH = DATA_DIR / "insurance.db"
-CSV_PATH = DATA_DIR / "providers.csv"
-CHROMA_DIR = DATA_DIR / "chroma_db"
-CHECKPOINT_DB_PATH = DATA_DIR / "checkpoints.db"  # LangGraph SqliteSaver
+_INSECURE_DEFAULT_SECRET = "change-me-in-production-please-32+chars"
 
-# ---------------------------------------------------------------------------
-# LLM Provider (provider-agnostic — swap via env vars)
-# ---------------------------------------------------------------------------
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq")  # groq | openai | ollama
-LLM_MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
-LLM_API_KEY = os.getenv("LLM_API_KEY", os.getenv("GROQ_API_KEY", ""))
-LLM_BASE_URL = os.getenv("LLM_BASE_URL", "")  # Custom endpoint (e.g., Ollama http://localhost:11434/v1)
+CsvList = Annotated[list[str], NoDecode]
 
-# Legacy aliases (for backward compat)
-GROQ_API_KEY = LLM_API_KEY
-GROQ_MODEL = LLM_MODEL
 
-# ---------------------------------------------------------------------------
-# Embedding model (for ChromaDB + sentence-transformers)
-# ---------------------------------------------------------------------------
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=PROJECT_DIR / ".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        case_sensitive=False,
+    )
 
-# ---------------------------------------------------------------------------
-# Server
-# ---------------------------------------------------------------------------
-BACKEND_HOST = os.getenv("BACKEND_HOST", "0.0.0.0")
-BACKEND_PORT = int(os.getenv("BACKEND_PORT", "8000"))
-BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8000")
+    # ── Application ──────────────────────────────────────────────────────
+    env: Literal["development", "test", "production"] = "development"
+    app_name: str = "HealthGuard"
+    app_version: str = "1.0.0"
+    api_prefix: str = "/api/v1"
+    log_level: str = "INFO"
+    log_json: bool = False
+    cors_origins: CsvList = Field(default_factory=lambda: ["http://localhost:8501"])
+    max_input_chars: int = 2000
 
-# ---------------------------------------------------------------------------
-# Agent prompts (data-source-specific prompts are in core/data_sources.py)
-# ---------------------------------------------------------------------------
-REWRITER_SYSTEM_PROMPT = (
-    "You are a query rewriter for a US health insurance assistant. "
-    "Your job is to normalize the user's query so downstream tools can process it accurately.\n\n"
-    "Apply ALL of the following transformations:\n"
-    "1. CONTEXTUALIZE: Use the provided conversation history to resolve pronouns and ambiguous references ('those', 'that plan', 'it'). If the user asks 'Which of those...', explicitly rewrite it to include what 'those' refers to.\n"
-    "2. Replace full US state names with their 2-letter abbreviations (e.g., 'Texas' → 'TX', 'California' → 'CA').\n"
-    "3. Replace colloquial medical terms with exact medical specialty names used in our database:\n"
-    "   - 'heart doctor' → 'Cardiologist'\n"
-    "   - 'skin doctor' → 'Dermatologist'\n"
-    "   - 'bone doctor' → 'Orthopedic Surgeon'\n"
-    "   - 'brain doctor' → 'Neurologist'\n"
-    "   - 'eye doctor' → 'Ophthalmologist'\n"
-    "   - 'children\\'s doctor' or 'child doctor' → 'Pediatrician'\n"
-    "   - 'stomach doctor' → 'Gastroenterologist'\n"
-    "   - 'lung doctor' → 'Pulmonologist'\n"
-    "   - 'ear nose throat' or 'ENT' → 'ENT Specialist'\n"
-    "   - 'family doctor', 'general practitioner', 'primary care' → 'PCP'\n"
-    "3. Fix obvious typos and spelling errors.\n"
-    "4. Expand common abbreviations if they are ambiguous.\n\n"
-    "RULES:\n"
-    "- Output ONLY the rewritten query. No explanations, no quotes, no prefixes.\n"
-    "- Do NOT answer the question. Only rewrite it.\n"
-    "- If the query is already well-formed, return it unchanged.\n"
-    "- Preserve the user's original intent exactly."
-)
+    # ── Infrastructure ───────────────────────────────────────────────────
+    database_url: str = "postgresql+asyncpg://healthguard:healthguard@localhost:5432/healthguard"
+    # Read-only, RLS-restricted role used exclusively for LLM-generated SQL.
+    agent_db_user: str = "hg_agent_ro"
+    agent_db_password: str = "hg_agent_ro_pw"
+    redis_url: str = "redis://localhost:6379/0"
+    db_pool_size: int = 10
+    db_max_overflow: int = 10
 
-ROUTER_SYSTEM_PROMPT = (
-    "Analyze the user query and route it to the appropriate tool based STRICTLY on the data schemas below:\n\n"
-    "1. 'SQL_TOOL': Use ONLY for comparing or querying insurance plan financial details. \n"
-    "   - Available data: plan names (e.g. Bronze Basic, Silver Plus), monthly premiums, individual deductibles, specialist copays, emergency room copays, and pharmacy tier 1 copays.\n"
-    "2. 'CSV_TOOL': Use ONLY for finding doctors or medical provider network information.\n"
-    "   - Available data: doctor names, medical specialties (e.g., Cardiologist, PCP), locations (city, state, zip_code), network tiers, and whether they are accepting new patients.\n"
-    "3. 'RAG_TOOL': Use ONLY for general text-based policy questions.\n"
-    "   - Available data: policy rules, medical exclusions, member rights, and claim procedures.\n"
-    "4. 'MULTI_TOOL': Use ONLY if the query explicitly requires a combination of the above (e.g. 'find a doctor in Austin under a plan with a $1000 deductible').\n\n"
-    "Return ONLY a valid JSON object with keys 'tool' and 'reason'. "
-    "Do not include any other text, markdown formatting, or preamble."
-)
+    # ── Auth ─────────────────────────────────────────────────────────────
+    jwt_secret: str = _INSECURE_DEFAULT_SECRET
+    jwt_algorithm: str = "HS256"
+    jwt_issuer: str = "healthguard"
+    access_token_ttl_minutes: int = 15
+    refresh_token_ttl_days: int = 7
+    password_min_length: int = 10
+    demo_password: str = "HealthGuard!2026"
+    admin_email: str = "admin@demo.healthguard.dev"
 
-VALIDATOR_SYSTEM_PROMPT = (
-    "You are a quality checker for a health insurance assistant.\n"
-    "Given the user's original question and the assistant's answer, determine:\n"
-    "1. Does the answer directly address the question asked?\n"
-    "2. Is any critical information missing that was explicitly requested?\n"
-    "3. Are the facts consistent (no contradictions)?\n\n"
-    "Reply with EXACTLY 'PASS' or 'FAIL' on the first line.\n"
-    "On the second line, provide a brief reason (one sentence).\n"
-    "Do NOT be overly strict — if the answer reasonably addresses the question, "
-    "return PASS even if it could be slightly more detailed."
-)
+    # ── Rate limits (per minute) ────────────────────────────────────────
+    rate_limit_chat_per_minute: int = 20
+    rate_limit_auth_per_minute: int = 10
+    rate_limit_feedback_per_minute: int = 30
+    # Turns per member account per UTC day (0 = unlimited); admins are exempt. Caps spend from open registration.
+    daily_turn_limit: int = 150
 
-# ---------------------------------------------------------------------------
-# Agentic control constants
-# ---------------------------------------------------------------------------
-MAX_TOOL_RETRIES = 2    # Max self-correction attempts for failed tool execution
-MAX_REACT_LOOPS = 2     # Max ReAct iterations (validate → re-route)
+    # ── LLM gateway (OpenRouter, OpenAI-compatible) ─────────────────────
+    openrouter_api_key: str = ""
+    llm_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_app_url: str = "https://github.com/syamsruthin/provider-agnostic-rag-agent"
+    openrouter_app_title: str = "HealthGuard Agentic RAG"
+    llm_timeout_seconds: float = 60.0
+    llm_max_retries: int = 3
+
+    # Per-role model registry. Every role defaults to the TypeSafe Jev Router, which picks the model and
+    # reasoning effort per request and bills at the serving model's price (the cost-efficient option).
+    # Fallbacks use OpenRouter's `models` routing, so a router or provider outage degrades to fixed models.
+    model_fast: str = "typesafe/jev-router"
+    model_fast_fallbacks: CsvList = Field(
+        default_factory=lambda: ["anthropic/claude-haiku-5.5", "google/gemini-3.8-flash"]
+    )
+    model_code: str = "typesafe/jev-router"
+    model_code_fallbacks: CsvList = Field(
+        default_factory=lambda: ["anthropic/claude-sonnet-5.5", "openai/gpt-5.4-mini"]
+    )
+    model_synth: str = "typesafe/jev-router"
+    model_synth_fallbacks: CsvList = Field(
+        default_factory=lambda: ["anthropic/claude-sonnet-5.5", "google/gemini-3.8-flash"]
+    )
+
+    # Judge ensembles ("jury") — different model families reduce self-preference bias. These stay fixed
+    # models on purpose: a router could send every judge to the same model and the jury would lose its point.
+    eval_judges: CsvList = Field(
+        default_factory=lambda: [
+            "openai/gpt-5.4-mini",
+            "google/gemini-3.8-flash",
+            "anthropic/claude-haiku-5.5",
+        ]
+    )
+    online_eval_judges: CsvList = Field(
+        default_factory=lambda: ["openai/gpt-5.4-mini", "google/gemini-3.8-flash"]
+    )
+    online_eval_sample_rate: float = 0.05  # share of answered turns judged live (every thumbs-down is judged)
+    judge_disagreement_threshold: float = 0.3
+
+    # ── Embeddings ───────────────────────────────────────────────────────
+    embedding_provider: Literal["openrouter", "local", "hash"] = "openrouter"
+    embedding_model: str = "openai/text-embedding-3-small"
+    embedding_dim: int = 1536
+    embedding_batch_size: int = 64
+
+    # ── Caching ──────────────────────────────────────────────────────────
+    prompt_cache_enabled: bool = True  # provider-side prompt caching markers
+    llm_exact_cache_enabled: bool = True  # Redis exact-match cache for temperature-0 calls
+    llm_exact_cache_ttl_seconds: int = 86_400
+    semantic_cache_enabled: bool = True
+    semantic_cache_distance_threshold: float = 0.08  # cosine distance
+    semantic_cache_ttl_public_seconds: int = 86_400
+    semantic_cache_ttl_member_seconds: int = 3_600
+
+    # ── Agent behaviour ─────────────────────────────────────────────────
+    max_tool_retries: int = 2
+    max_replans: int = 1
+    max_revisions: int = 1  # rewrites without unsupported claims before an answer is replaced
+    max_plan_steps: int = 4
+    sql_statement_timeout_ms: int = 5_000
+    sql_max_rows: int = 200
+    sandbox_timeout_seconds: float = 10.0
+    sandbox_memory_mb: int = 1024
+    sandbox_max_rows: int = 100
+    sandbox_workers: int = 2
+    rag_top_k: int = 6
+    rag_candidate_k: int = 20
+    rag_rerank: bool = False
+    tool_step_timeout_seconds: float = 90.0  # wall clock per plan step (includes self-correction retries)
+    # Wall clock for a whole agent turn; the conversation's turn lock lives 30 s longer.
+    turn_timeout_seconds: float = 150.0
+    # Replace answers the verifier judges ungrounded with the insufficient-context fallback
+    # (false = keep the answer and only log the verdict).
+    verify_replace_ungrounded: bool = True
+
+    # ── Memory ───────────────────────────────────────────────────────────
+    history_token_budget: int = 2_500
+    summary_trigger_tokens: int = 3_000
+    long_term_memory_top_k: int = 5
+    long_term_memory_min_similarity: float = 0.35
+
+    # ── Observability ────────────────────────────────────────────────────
+    otel_exporter_otlp_endpoint: str = ""
+    otel_service_name: str = "healthguard-api"
+
+    # ── Paths ────────────────────────────────────────────────────────────
+    data_dir: Path = BACKEND_DIR / "data"
+
+    @field_validator(
+        "cors_origins",
+        "model_fast_fallbacks",
+        "model_code_fallbacks",
+        "model_synth_fallbacks",
+        "eval_judges",
+        "online_eval_judges",
+        mode="before",
+    )
+    @classmethod
+    def _split_csv(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [v.strip() for v in value.split(",") if v.strip()]
+        return value
+
+    @model_validator(mode="after")
+    def _production_guards(self) -> Settings:
+        if self.env == "production":
+            if self.jwt_secret == _INSECURE_DEFAULT_SECRET or len(self.jwt_secret) < 32:
+                raise ValueError("JWT_SECRET must be set to a strong (32+ char) value in production")
+            if not self.openrouter_api_key and self.embedding_provider == "openrouter":
+                raise ValueError("OPENROUTER_API_KEY is required in production")
+        return self
+
+    # ── Derived values ───────────────────────────────────────────────────
+    @property
+    def lake_dir(self) -> Path:
+        """CSV 'data lake' (providers, facilities, pharmacies, zip centroids)."""
+        return self.data_dir / "lake"
+
+    @property
+    def corpus_dir(self) -> Path:
+        """Rendered policy corpus (markdown) consumed by the ingest pipeline."""
+        return self.data_dir / "corpus"
+
+    @property
+    def sync_database_url(self) -> str:
+        """psycopg-style URL (used by Alembic and the LangGraph checkpointer)."""
+        return self.database_url.replace("postgresql+asyncpg://", "postgresql://")
+
+    @property
+    def agent_database_dsn(self) -> str:
+        """Plain asyncpg DSN for the read-only agent role."""
+        base = self.sync_database_url
+        scheme, rest = base.split("://", 1)
+        hostpart = rest.split("@", 1)[1] if "@" in rest else rest
+        return f"{scheme}://{self.agent_db_user}:{self.agent_db_password}@{hostpart}"
+
+    @property
+    def llm_enabled(self) -> bool:
+        return bool(self.openrouter_api_key) or "openrouter.ai" not in self.llm_base_url
+
+
+@lru_cache
+def get_settings() -> Settings:
+    return Settings()
+
+
+settings = get_settings()

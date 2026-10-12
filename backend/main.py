@@ -1,210 +1,95 @@
 """
-HealthGuard Agentic RAG — FastAPI Backend
-==========================================
-Entry point for the backend API server.
-Wires /chat and /chat/stream endpoints to the agentic LangGraph pipeline.
+HealthGuard API — application factory.
+
+    uvicorn backend.main:app
+
+Lifespan: Postgres checkpointer + agent graph, arq job queue, semantic-cache
+index, sandbox warm-up; everything is closed in reverse order on shutdown.
 """
 
-import json
-import os
-import uuid
+from __future__ import annotations
+
+import asyncio
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from prometheus_fastapi_instrumentator import Instrumentator
 
-load_dotenv()
+from backend.agents.graph import build_graph, open_checkpointer, set_graph
+from backend.agents.tools import sandbox
+from backend.api.middleware import BodySizeLimitMiddleware, RequestContextMiddleware
+from backend.api.routers import admin, auth, conversations, feedback, health, me
+from backend.cache.semantic import get_semantic_cache
+from backend.core.config import settings
+from backend.core.errors import install_error_handlers
+from backend.core.logging import configure_logging, get_logger
+from backend.core.redis import close_redis
+from backend.core.telemetry import setup_tracing
+from backend.db.session import dispose
+from backend.services.chat_service import drain_background
+from backend.workers.queue import ArqEnqueuer, set_enqueuer
 
-# ---------------------------------------------------------------------------
-# Lifespan — startup / shutdown hooks
-# ---------------------------------------------------------------------------
+log = get_logger(__name__)
+
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Startup: verify data files, warm up RAG index. Shutdown: cleanup."""
-    from pathlib import Path
-    from backend.core.config import DATA_DIR, LOGS_DIR
-
-    db_path = DATA_DIR / "insurance.db"
-    csv_path = DATA_DIR / "providers.csv"
-    docs_dir = DATA_DIR / "docs"
-
-    missing = []
-    if not db_path.exists():
-        missing.append(str(db_path))
-    if not csv_path.exists():
-        missing.append(str(csv_path))
-    if not docs_dir.exists():
-        missing.append(str(docs_dir))
-
-    if missing:
-        print(
-            "⚠️  Missing data files. Run 'python -m backend.scripts.setup_data' first.\n"
-            f"   Missing: {missing}"
-        )
-
-    # Ensure logs directory exists
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Warm up the RAG index (downloads embedding model + indexes docs)
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    pool, saver = await open_checkpointer()
+    set_graph(build_graph(saver))
+    enqueuer = await ArqEnqueuer.create()
+    set_enqueuer(enqueuer)
     try:
-        from backend.agents.rag_agent import index_documents
-        count = index_documents()
-        print(f"✅ RAG index ready — {count} chunks")
-    except Exception as e:
-        print(f"⚠️  RAG index warm-up failed: {e}")
-
-    print("🚀 HealthGuard API started (Agentic LangGraph pipeline).")
-    yield
-    print("👋 HealthGuard API shutdown.")
-
-
-# ---------------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------------
-app = FastAPI(
-    title="HealthGuard Agentic RAG",
-    description="Fully agentic health insurance assistant — conditional routing, retry loops, validation, ReAct, streaming",
-    version="0.4.0",
-    lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ---------------------------------------------------------------------------
-# Schemas
-# ---------------------------------------------------------------------------
-class ChatRequest(BaseModel):
-    user_input: str = Field(..., min_length=1, description="The user's question.")
-    session_id: str = Field(
-        default_factory=lambda: str(uuid.uuid4()),
-        description="Session ID for conversation continuity (maps to LangGraph thread_id).",
-    )
-
-
-class ChatResponse(BaseModel):
-    session_id: str
-    trace_id: str
-    answer: str
-    tools_used: list[str] = []
-    trace_markdown: str = ""
-    retry_count: int = 0
-    react_count: int = 0
-    validation_result: str = ""
-
-
-class HistoryResponse(BaseModel):
-    session_id: str
-    exchanges: list[dict]
-    total: int
-
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-@app.get("/health")
-async def health_check():
-    return {"status": "ok", "service": "healthguard-api", "version": "0.4.0"}
-
-
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    """
-    Main chat endpoint (synchronous).
-    Runs the full agentic pipeline: Rewrite → Route → Execute (with retry)
-    → Synthesize → Validate (with ReAct loop) → Finalize.
-    """
-    from backend.agents.orchestrator import process_query
-
+        await get_semantic_cache().ensure_index()
+    except Exception as exc:  # the cache is optional
+        log.warning("semantic_cache_unavailable", error=str(exc)[:200])
+    warm = asyncio.create_task(sandbox.warm_up())
+    log.info("api_started", env=settings.env)
     try:
-        result = process_query(
-            user_input=request.user_input,
-            session_id=request.session_id,
-        )
-        return ChatResponse(
-            session_id=result["session_id"],
-            trace_id=result["trace_id"],
-            answer=result["answer"],
-            tools_used=result["tools_used"],
-            trace_markdown=result["trace_markdown"],
-            retry_count=result["retry_count"],
-            react_count=result["react_count"],
-            validation_result=result["validation_result"],
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Agent error: {str(e)}")
+        yield
+    finally:
+        await drain_background()
+        warm.cancel()
+        sandbox.shutdown()
+        set_enqueuer(None)
+        await enqueuer.close()
+        set_graph(None)
+        await pool.close()
+        await close_redis()
+        await dispose()
+        log.info("api_stopped")
 
 
-@app.post("/chat/stream")
-async def chat_stream(request: ChatRequest):
-    """
-    Streaming chat endpoint (SSE).
-    Returns Server-Sent Events as each graph node starts/completes.
-    Clients receive real-time progress updates.
-    """
-    from backend.agents.orchestrator import astream_query
-
-    async def event_generator():
-        try:
-            async for event in astream_query(
-                user_input=request.user_input,
-                session_id=request.session_id,
-            ):
-                yield f"data: {json.dumps(event)}\n\n"
-        except Exception as e:
-            yield f"data: {json.dumps({'event': 'error', 'detail': str(e)})}\n\n"
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        },
+def create_app(*, with_lifespan: bool = True) -> FastAPI:
+    configure_logging()
+    app = FastAPI(
+        title=settings.app_name,
+        version=settings.app_version,
+        lifespan=lifespan if with_lifespan else None,
+        docs_url="/docs" if settings.env != "production" else None,
+        redoc_url=None,
     )
-
-
-@app.get("/history/{session_id}", response_model=HistoryResponse)
-async def get_history(session_id: str):
-    """Retrieve conversation history for a session from LangGraph checkpointer."""
-    from backend.agents.orchestrator import get_thread_history
-
-    exchanges = get_thread_history(session_id)
-    return HistoryResponse(
-        session_id=session_id,
-        exchanges=exchanges,
-        total=len(exchanges),
+    install_error_handlers(app)
+    app.add_middleware(BodySizeLimitMiddleware, max_bytes=64 * 1024)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=settings.cors_origins,
+        allow_credentials=False,  # bearer tokens, no cookies
+        allow_methods=["GET", "POST", "PATCH", "DELETE"],
+        allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
     )
+    app.add_middleware(RequestContextMiddleware)
 
+    app.include_router(health.router)
+    for router in (auth.router, conversations.router, feedback.router, me.router, admin.router):
+        app.include_router(router, prefix=settings.api_prefix)
 
-@app.delete("/history/{session_id}")
-async def clear_history(session_id: str):
-    """Clear conversation history for a session."""
-    from backend.agents.orchestrator import clear_thread_history
-
-    clear_thread_history(session_id)
-    return {"status": "cleared", "session_id": session_id}
-
-
-# ---------------------------------------------------------------------------
-# Entrypoint (for `python -m backend.main` or direct run)
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        "backend.main:app",
-        host=os.getenv("BACKEND_HOST", "0.0.0.0"),
-        port=int(os.getenv("BACKEND_PORT", "8000")),
-        reload=True,
+    Instrumentator(excluded_handlers=["/metrics", "/health/.*"]).instrument(app).expose(
+        app, include_in_schema=False
     )
+    setup_tracing(app)
+    return app
+
+
+app = create_app()

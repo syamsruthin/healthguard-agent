@@ -1,128 +1,81 @@
-from typing import Tuple
-from backend.core.llm import llm_completion
+"""
+Deterministic guardrails (run before any LLM call) and standard fallback replies.
 
-# Fallback Responses
-FALLBACK_OUT_OF_SCOPE = "This system is designed to answer questions only from its authorized knowledge sources."
-FALLBACK_NO_DATA = "No relevant information was found in the available knowledge sources."
-FALLBACK_INSUFFICIENT_CONTEXT = "The available data is insufficient to provide a complete answer."
+The LLM `understand` step performs the nuanced scope/safety classification;
+these cheap checks stop obvious injection attempts and cross-member ID
+probing without spending tokens. Row-Level Security is the final backstop.
+"""
 
-# Authorized Knowledge Boundaries (AKB) description
-AKB_DESCRIPTION = "The system has access to a SQLite database, CSV files, and specific text documents."
+from __future__ import annotations
 
-def query_validator(user_query: str, conversation_history: str = "") -> Tuple[bool, str]:
-    """
-    Input Guardrail (Pre-Processing).
-    Classifies whether the user query is within the Authorized Knowledge Boundary (AKB).
-    Rejects general knowledge, hypothetical, or unrelated queries.
-    Accepts conversation_history so follow-up queries with pronouns are understood in context.
-    Returns: (is_valid: bool, fallback_message: str)
-    """
-    history_block = ""
-    if conversation_history:
-        history_block = f"""
-    Recent Conversation History (for context — the user may be asking a follow-up):
-    ---
-    {conversation_history}
-    ---
-    """
+import re
 
-    prompt = f"""
-    You are an input guardrail for an enterprise system. 
-    The system is STRICTLY restricted to answering queries using its Authorized Knowledge Base (AKB), which contains:
-    - Relational data in a SQLite database
-    - Tabular data in CSV files
-    - Specific text documents
-    {history_block}
-    Your task is to determine if the user query is asking for general knowledge, opinions, hypothetical scenarios, or topics entirely outside the scope of querying internal enterprise documents and databases.
-    - If the query looks like a legitimate search, follow-up question, data request, or clarification, return PASS.
-    - If the query is conversational but clearly related to the ongoing search for enterprise information, return PASS.
-    - ONLY return FAIL if the query is undeniably out of scope (e.g., "Write a poem", "What is the capital of France?").
+from backend.agents.tools.base import UserContext
 
-    User Query: "{user_query}"
+FALLBACKS: dict[str, str] = {
+    "out_of_scope": (
+        "I can help with HealthGuard plans, benefits, claims, prescriptions, prior authorizations, providers and "
+        "policies — but that question is outside what I can answer. Is there something about your coverage I can help with?"
+    ),
+    "prompt_injection": (
+        "I can't help with that request. I can answer questions about your HealthGuard coverage, claims, "
+        "providers and policies."
+    ),
+    "other_member_data": (
+        "For privacy, I can only discuss your own records and those of dependents on your plan. If you are "
+        "authorized to act for another member, they can name you as an authorized representative (Form HG-AR1) "
+        "through Member Services at 1-800-446-3623."
+    ),
+    "medical_advice": (
+        "I can't give medical advice — please talk with your doctor, or call the 24/7 Nurse Advice Line at "
+        "1-800-446-8773. I'm happy to explain what your plan covers for this care or find an in-network provider."
+    ),
+    "harmful": (
+        "If you are thinking about harming yourself or are in crisis, please call or text **988** (Suicide & "
+        "Crisis Lifeline) now, or call 911 in an emergency. HealthGuard's Behavioral Health Line is available "
+        "24/7 at 1-800-446-3682 and can arrange urgent care for you."
+    ),
+    "llm_unavailable": (
+        "I'm having trouble reaching the AI service right now, so I can't answer this yet. Please try again in "
+        "a moment, or call Member Services at 1-800-446-3623."
+    ),
+    "insufficient_context": (
+        "I couldn't verify a complete answer from HealthGuard's records and policy documents, so I'd rather not "
+        "guess. Please try rephrasing, or contact Member Services at 1-800-446-3623 for help."
+    ),
+    "no_data": (
+        "I couldn't retrieve the information needed to answer that right now. Please try again, or contact "
+        "Member Services at 1-800-446-3623."
+    ),
+    "timeout": (
+        "That took longer than expected, so I stopped before finishing. Please try again, or ask a narrower "
+        "question. You can also call Member Services at 1-800-446-3623."
+    ),
+}
 
-    Reply with ONLY the word PASS or FAIL on the first line.
-    """
-    try:
-        verdict = llm_completion([{"role": "user", "content": prompt}], temperature=0, max_tokens=10).strip().upper()
-        if verdict.startswith("FAIL"):
-            return False, FALLBACK_OUT_OF_SCOPE
-        return True, ""
-    except Exception:
-        # Fail open on LLM error to not break the system entirely.
-        return True, ""
+_INJECTION_PATTERNS = [
+    r"\bignore\s+(all\s+|any\s+|the\s+)?(previous|prior|above|earlier|your)\s+(instructions|rules|prompts?)",
+    r"\b(reveal|print|show|repeat|output)\s+(me\s+)?(your|the)\s+(system|hidden|initial)\s+(prompt|instructions)",
+    r"\byou\s+are\s+now\s+(an?\s+)?(admin|administrator|developer|dan|root)\b",
+    r"\b(developer|god|jailbreak)\s+mode\b",
+    r"\b(drop|truncate|alter)\s+table\b",
+    r"\bdelete\s+from\b",
+    r"\bupdate\s+\w+\s+set\b",
+    r"\b(pg_sleep|set_config|current_setting|pg_read_file|dblink)\s*\(",
+    r"<\|im_(start|end)\|>|\[/?INST\]",
+    r"\bact\s+as\s+(an?\s+)?(admin|administrator|database|sql)\b",
+]
+_INJECTION = re.compile("|".join(_INJECTION_PATTERNS), re.IGNORECASE)
+_MEMBER_ID = re.compile(r"\bM\d{6}\b", re.IGNORECASE)
 
-def context_validator(query: str, retrieved_context: str) -> Tuple[bool, str]:
-    """
-    Context Validation Layer.
-    Checks if retrieved context is sufficient to answer the query.
-    Returns: (is_sufficient: bool, fallback_message: str)
-    """
-    if not retrieved_context or retrieved_context.strip() == "":
-        return False, FALLBACK_NO_DATA
 
-    prompt = f"""
-    You are a context validator for an enterprise system.
-    Evaluate whether the provided context contains sufficient information to answer the user query.
-    
-    User Query: "{query}"
-    
-    Retrieved Context:
-    ---
-    {retrieved_context}
-    ---
-    
-    - The Retrieved Context may contain raw data tables, executed code (SQL/Python), and Conversation History.
-    - If the context contains the raw data OR the executed code that logically proves the answer to the query, it is sufficient.
-    - Do not be overly rigid; if the data, code, or history combined provide enough information to logically form an answer, reply with PASS.
-    - If the context is entirely empty, irrelevant, or vastly insufficient, reply with FAIL.
-    
-    Reply with ONLY the word PASS or FAIL on the first line.
-    """
-    try:
-        verdict = llm_completion([{"role": "user", "content": prompt}], temperature=0, max_tokens=10).strip().upper()
-        if verdict.startswith("FAIL"):
-            return False, FALLBACK_INSUFFICIENT_CONTEXT
-        return True, ""
-    except Exception:
-        return True, ""
-
-def response_validator(query: str, context: str, response: str) -> bool:
-    """
-    Output Guardrails (Post-Processing).
-    Verifies the response is grounded in the retrieved context and introduces no external knowledge.
-    Returns: bool (True if valid, False if hallucinated/unsupported)
-    """
-    prompt = f"""
-    You are an output guardrail for a strict enterprise AI system.
-    Your task is to ensure the Assistant's Response is STRICTLY grounded in the Retrieved Context.
-    
-    User Query: "{query}"
-    
-    Retrieved Context:
-    ---
-    {context}
-    ---
-    
-    Assistant Response:
-    ---
-    {response}
-    ---
-    
-    Evaluate the Assistant Response against the Retrieved Context.
-    - The Retrieved Context may contain Tool Results, Executed Code, and Conversation History.
-    - Information found in the Conversation History OR the User Query is considered VALID and GROUNDED.
-    - It is perfectly acceptable for the Assistant to repeat facts (like locations or names) previously mentioned by the user or in the history.
-    - Do not penalize the Assistant for summarizing data or stating the logical result of the Executed Code.
-    - If the response contains ANY external facts, numbers, names, or assertions that are NOT explicitly present in the Tool Results, Executed Code, Conversation History, NOR the User Query, you must reject it.
-    - It is completely ACCEPTABLE for the response to state that certain information is missing or not provided. Do NOT reject the response for admitting a lack of information.
-    
-    If the response is fully grounded (or correctly states info is missing), reply with ONLY the word: PASS
-    If the response contains ungrounded information, external knowledge, or hallucinations, reply with ONLY the word: FAIL
-    """
-    try:
-        verdict = llm_completion([{"role": "user", "content": prompt}], temperature=0, max_tokens=10).strip().upper()
-        if verdict.startswith("FAIL"):
-            return False
-        return True
-    except Exception:
-        return True
+def prefilter(message: str, user: UserContext) -> str | None:
+    """Return a block reason, or None if the message may proceed to the LLM."""
+    if _INJECTION.search(message):
+        return "prompt_injection"
+    if not user.is_admin:
+        allowed = {user.member_id, *(d["member_id"] for d in user.dependents)} - {None}
+        mentioned = {m.upper() for m in _MEMBER_ID.findall(message)}
+        if mentioned - allowed:
+            return "other_member_data"
+    return None

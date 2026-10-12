@@ -1,0 +1,58 @@
+name: Offline evaluation (RAGAS + judge ensemble)
+
+# Manual only: every run spends OpenRouter credit (≈ $0.03 per case with the 3-judge jury on the router default);
+# `hg-eval --dry-run --limit N` prints the estimate.
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Golden cases to run (blank = all 59)"
+        required: false
+        default: "10"
+      judges:
+        description: "Judges from EVAL_JUDGES to use (0 = all)"
+        required: false
+        default: "0"
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: healthguard
+          POSTGRES_PASSWORD: healthguard
+          POSTGRES_DB: healthguard
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U healthguard" --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:8
+        ports: ["6379:6379"]
+    env:
+      ENV: test
+      DATABASE_URL: postgresql+asyncpg://healthguard:healthguard@localhost:5432/healthguard
+      REDIS_URL: redis://localhost:6379/0
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      JWT_SECRET: ci-only-secret-value-that-is-long-enough-123
+      SEMANTIC_CACHE_ENABLED: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups --frozen
+      - run: uv run hg-models-check
+      - run: |
+          uv run alembic upgrade head
+          uv run hg-seed
+          uv run hg-ingest
+      - name: Run golden suite (fails on threshold regression)
+        run: uv run hg-eval --suite golden --judges ${{ github.event.inputs.judges || 0 }} ${{ github.event.inputs.limit && format('--limit {0}', github.event.inputs.limit) || '' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-report
+          path: backend/evals/reports/

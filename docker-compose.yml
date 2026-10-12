@@ -1,0 +1,97 @@
+# HealthGuard production-style stack.
+#   docker compose up -d --build          # full stack
+#   docker compose --profile observability up -d   # + Jaeger tracing UI
+x-app: &app
+  build:
+    context: .
+    dockerfile: deploy/Dockerfile
+  image: healthguard:latest
+  env_file: .env
+  environment: &app-env
+    DATABASE_URL: postgresql+asyncpg://healthguard:${POSTGRES_PASSWORD:-healthguard}@postgres:5432/healthguard
+    REDIS_URL: redis://redis:6379/0
+  volumes:
+    - hg-data:/app/backend/data
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_USER: healthguard
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-healthguard}
+      POSTGRES_DB: healthguard
+    # Host port is configurable for machines that already run a native Postgres on 5432.
+    ports: ["${POSTGRES_HOST_PORT:-5432}:5432"]
+    volumes: [pg-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U healthguard -d healthguard"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    # Redis 8 ships the Query Engine (vector search) used by the semantic cache.
+    image: redis:8
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "allkeys-lru"]
+    ports: ["6379:6379"]
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: schema migrations → synthetic data → policy corpus ingestion.
+  migrate:
+    <<: *app
+    command: >
+      sh -c "alembic upgrade head && hg-seed && hg-ingest"
+    restart: "no"
+
+  api:
+    <<: *app
+    ports: ["8000:8000"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  worker:
+    <<: *app
+    command: ["arq", "backend.workers.settings.WorkerSettings"]
+    healthcheck:
+      disable: true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  ui:
+    <<: *app
+    command: ["streamlit", "run", "frontend/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+    environment:
+      <<: *app-env
+      BACKEND_URL: http://api:8000
+    ports: ["8501:8501"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8501/_stcore/health"]
+    depends_on:
+      api:
+        condition: service_started
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    profiles: ["observability"]
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports: ["16686:16686", "4318:4318"]
+
+volumes:
+  pg-data:
+  redis-data:
+  hg-data:

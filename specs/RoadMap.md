@@ -73,3 +73,22 @@
 - [x] **Memory-Aware Validation**: Integrated conversation history into the guardrail contexts so valid follow-up answers are not falsely flagged as hallucinations.
 - [x] **Robust Logic Derivation**: Upgraded context and output guardrails to analyze executed SQL/Python code and user queries, eliminating false-positive hallucination flags on strictly filtered data.
 - **Commit**: `feat: implement strict 3-layer input, context, and output guardrails`
+## Milestone 10: Production Upgrade (OpenRouter · Postgres · Redis · evaluations)
+Status and measured results: [docs/IMPLEMENTATION_STATUS.md](../docs/IMPLEMENTATION_STATUS.md). Architecture: [docs/architecture.md](../docs/architecture.md).
+- [x] **Foundation**: pydantic settings, structlog with PII masking, Prometheus + OpenTelemetry, Docker Compose, CI.
+- [x] **Database**: Postgres 17 + pgvector, Alembic, read-only agent role, Row-Level Security on member data.
+- [x] **Synthetic data**: 40 plans, 1.5k members in families, 14k adjudicated claims, 5k providers, 60-document corpus, 6 personas + admin.
+- [x] **LLM layer**: OpenRouter per-role models with fallbacks, prompt caching, exact cache, usage and cost accounting.
+- [x] **RAG**: markdown-aware chunking, idempotent ingest, pgvector + full-text hybrid retrieval with RRF.
+- [x] **Hardened tools**: sqlglot SQL guard + RLS execution, pandas process sandbox.
+- [x] **Agent**: plan → parallel execute → stream synthesis → verify (one rewrite, one replan), plan sanitising, error-coded fallbacks.
+- [x] **API**: JWT with refresh rotation, conversations, SSE chat, feedback, coverage, admin metrics, rate limits.
+- [x] **Memory**: token-budgeted window, rolling summary, privacy-filtered long-term memories.
+- [x] **Worker**: arq tasks for titles, summaries, memories, online LLM-judge jury, offline evals.
+- [x] **UI**: multipage Streamlit with streaming chat, coverage, memory controls and admin dashboards.
+- [x] **Evaluation**: golden set from the database, `hg-eval` with deterministic checks + RAGAS judge jury + quality gate.
+- [x] **Tests**: ~250 unit / integration tests, a live persona suite, combined coverage gate.
+- [x] **Router**: the TypeSafe Jev Router as the default for planning, code and synthesis, with fixed-model fallbacks.
+- [x] **Engineering review**: validated-only exact cache, turn deadline and owned locks, PII-safe logs, cache-first answers, gated background calls, spend guards, judge cost, admin-only traces, shared codegen loop.
+- [ ] **Evaluation on the router**: re-run the golden suite and meet the RAGAS gate.
+- **Commits**: one per phase on `claude/vigilant-wozniak-f6rbb3`.
