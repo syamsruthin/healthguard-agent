@@ -11,7 +11,7 @@ from sqlalchemy import delete, select
 from backend.db.models import Conversation, EvalResult, EvalRun
 from backend.db.session import SessionLocal
 from backend.evals import run as eval_run
-from backend.evals.run import execute, rescore
+from backend.evals.run import _eval_turns, execute, rescore
 
 CASES = [
     {
@@ -127,6 +127,58 @@ async def test_rescore_rejudges_stored_answers(tmp_path: Path, fake_llm, monkeyp
         async with SessionLocal() as session:
             run = await session.get(EvalRun, run_ids[1])
             assert run is not None and run.config["rescore_of"] == source["run_id"]
+    finally:
+        async with SessionLocal() as session:
+            await session.execute(delete(EvalRun).where(EvalRun.id.in_(run_ids)))
+            await session.execute(delete(Conversation).where(Conversation.title.like("eval t-%")))
+            await session.commit()
+        for outcome in (source, redo):
+            for suffix in (".md", ".json"):
+                Path(outcome["report"]).with_suffix(suffix).unlink(missing_ok=True)
+
+
+FOLLOW_UP = {
+    **CASES[2],
+    "id": "t-follow",
+    "prior_turns": ["Hi!"],
+    "question": "And how are you?",
+}
+
+
+async def test_rescore_recovers_follow_up_turns_from_the_source_run(
+    tmp_path: Path, fake_llm, monkeypatch
+) -> None:
+    """Old runs only stored the last turn's sources: rescore finds the case's conversation and its turns."""
+    dataset = tmp_path / "golden.jsonl"
+    dataset.write_text("".join(json.dumps(c) + "\n" for c in [CASES[2], FOLLOW_UP]))
+    fake_llm({"understand": _understand, "synthesize": "Hi! How can I help with your coverage?"})
+    source = await execute(dataset=dataset, use_ragas=False, concurrency=2)
+    jury = _FakeJury(["a"], ())
+    monkeypatch.setattr(eval_run, "Jury", lambda judges, metrics: jury)
+    redo = await rescore(uuid.UUID(source["run_id"]), judges=["a"], dataset=dataset)
+    run_ids = [uuid.UUID(source["run_id"]), uuid.UUID(redo["run_id"])]
+    try:
+        async with SessionLocal() as session:
+            run = await session.get(EvalRun, run_ids[0])
+            stored = (
+                (
+                    await session.execute(
+                        select(EvalResult).where(
+                            EvalResult.run_id == run_ids[0], EvalResult.case_id == "t-follow"
+                        )
+                    )
+                )
+                .scalars()
+                .one()
+            )
+            assert run is not None
+            found = await _eval_turns(session, run, stored)
+        assert found is not None
+        turns, standalone = found
+        assert [q for q, _ in turns] == ["Hi!", "And how are you?"] and all(t for _, t in turns)
+        assert standalone == "hello"  # the resolved question, as `execute` judges follow-ups
+        questions = sorted(str(call["question"]) for call in jury.calls)
+        assert questions == ["Hello there!", "hello"]
     finally:
         async with SessionLocal() as session:
             await session.execute(delete(EvalRun).where(EvalRun.id.in_(run_ids)))

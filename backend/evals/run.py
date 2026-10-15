@@ -26,6 +26,7 @@ import re
 import sys
 import time
 import uuid
+from collections.abc import Iterable
 from decimal import Decimal
 from pathlib import Path
 from statistics import mean, quantiles
@@ -41,7 +42,7 @@ from backend.core.config import settings
 from backend.core.logging import configure_logging, get_logger
 from backend.core.redis import close_redis
 from backend.db.base import utcnow
-from backend.db.models import EvalResult, EvalRun, Trace
+from backend.db.models import Conversation, EvalResult, EvalRun, Message, Trace, User
 from backend.db.session import SessionLocal, dispose
 from backend.evals.build_golden import DATASET, load
 from backend.evals.checks import aggregate, case_checks
@@ -55,9 +56,16 @@ log = get_logger(__name__)
 THRESHOLDS = Path(__file__).parent / "thresholds.yaml"
 _SOURCE_SPLIT = re.compile(r"\n\n(?=\[[SD]\d+\])")
 
-# Rough costs (USD) used only for the pre-run estimate: an agent turn on the default Jev Router
-# (measured $0.009–0.017; $0.023–0.039 on fixed Claude models) and one fixed-model judge call.
-_TURN_COST = 0.015
+_EARLIER_TURN = "From an earlier turn of this conversation (the user asked: {question})\n"
+
+# Pre-run estimate (USD), calibrated on runs 82775a45 and 60d20114 (agent cost per turn from app.llm_calls,
+# judge cost per call from the judges' Langfuse generations) and rounded up, so it over-estimates by ~20–30%:
+# * an agent turn averaged $0.004–0.005 on the default Jev Router (single turns up to $0.018) and
+#   $0.013–0.039 on fixed Claude models;
+# * a judge call cost ~$0.0022 per source the answer draws on: a two-source answer is about twice as long,
+#   so its claim lists (and the judges' output) are about twice as long too;
+# * judges differ: Gemini (mostly hidden reasoning tokens) cost 1.8x the jury average, GPT 0.8x, Haiku 0.4x.
+_TURN_COST = {"router": 0.006, "fixed": 0.03}
 _JUDGE_CALLS_PER_METRIC = {
     "faithfulness": 2,
     "answer_relevancy": 1,
@@ -65,7 +73,10 @@ _JUDGE_CALLS_PER_METRIC = {
     "context_precision": 4,
     "factual_correctness": 2,
 }
-_JUDGE_CALL_COST = 0.0015
+_JUDGE_CALL_COST = 0.0025  # one call by an average judge, per source the answer draws on
+_PRIOR_TURN_PARTS = 0.25  # an earlier turn's sources lengthen the judges' contexts (cheap input tokens)
+_JUDGE_WEIGHT = {"google/": 1.8, "openai/": 0.8, "anthropic/": 0.4}
+_UNKNOWN_JUDGE_WEIGHT = 1.8  # an unmeasured judge is assumed to be as expensive as the dearest one
 
 
 def select_cases(
@@ -96,11 +107,58 @@ def judged_question(case: dict[str, Any], result: dict[str, Any]) -> str:
     return str(case["question"])
 
 
-def estimate_cost(cases: list[dict[str, Any]], metrics: tuple[str, ...], judges: int) -> float:
-    turns = sum(1 + len(c.get("prior_turns") or []) for c in cases)
-    scored = sum(1 for c in cases if c["expected_outcome"] != "blocked")
-    judge_calls = scored * judges * sum(_JUDGE_CALLS_PER_METRIC[m] for m in metrics)
-    return round(turns * _TURN_COST + judge_calls * _JUDGE_CALL_COST, 2)
+def turn_cost(models: Iterable[str]) -> float:
+    """Estimated USD per agent turn: cheap when every role runs on a router, dearer on fixed models."""
+    return _TURN_COST["router"] if all("router" in m for m in models) else _TURN_COST["fixed"]
+
+
+def judge_weight(judge: str) -> float:
+    """A judge's measured cost relative to the jury average."""
+    return next((w for prefix, w in _JUDGE_WEIGHT.items() if judge.startswith(prefix)), _UNKNOWN_JUDGE_WEIGHT)
+
+
+def answer_parts(case: dict[str, Any]) -> float:
+    """How many sources the judged answer draws on (judge cost grows with it), plus its earlier turns."""
+    earlier = len(case.get("prior_turns") or [])
+    return max(1, len(case.get("expected_tools") or [])) + _PRIOR_TURN_PARTS * earlier
+
+
+def estimate_cost(
+    cases: list[dict[str, Any]],
+    metrics: tuple[str, ...],
+    judges: list[str],
+    *,
+    per_turn: float | None = None,
+) -> dict[str, float]:
+    """{"agent", "judges", "total"} in USD; blocked cases are not judged."""
+    if per_turn is None:
+        per_turn = turn_cost((settings.model_fast, settings.model_code, settings.model_synth))
+    agent = sum(1 + len(c.get("prior_turns") or []) for c in cases) * per_turn
+    parts = sum(answer_parts(c) for c in cases if c["expected_outcome"] != "blocked")
+    calls = sum(_JUDGE_CALLS_PER_METRIC[m] for m in metrics)
+    judging = parts * calls * _JUDGE_CALL_COST * sum(judge_weight(j) for j in judges)
+    return {"agent": round(agent, 2), "judges": round(judging, 2), "total": round(agent + judging, 2)}
+
+
+def conversation_contexts(turns: list[tuple[str, list[str]]]) -> list[str]:
+    """Judge contexts for a case from its turns' (user message, sources), oldest first.
+
+    The judged (last) turn's sources come first. A follow-up builds on facts an earlier turn looked
+    up (the agent sees that exchange in its recent turns), so each earlier turn's sources follow,
+    labelled with the question that retrieved them. The earlier answers are not added: they are the
+    agent's own words, not evidence, and would let a repeated mistake look supported.
+    """
+    if not turns:
+        return []
+    *earlier, (_, last) = turns
+    return [
+        *last,
+        *(
+            f"{_EARLIER_TURN.format(question=question)}{source}"
+            for question, sources in earlier
+            for source in sources
+        ),
+    ]
 
 
 async def _sources(trace_id: str | None) -> list[str]:
@@ -130,17 +188,19 @@ async def run_case(case: dict[str, Any]) -> dict[str, Any]:
         conv = await conversation_service.create(session, user, title=f"eval {case['id']}", is_eval=True)
         cost = 0.0
         payload: dict[str, Any] = {}
+        turns: list[tuple[str, str | None]] = []
         for message in [*(case.get("prior_turns") or []), case["question"]]:
             prepared = await chat_service.prepare_turn(session, user, conv.id, message)
             payload = await chat_service.run_turn(prepared)
             cost += float(payload["usage"].get("cost_usd", 0))
+            turns.append((message, payload.get("trace_id")))
     return {
         "answer": payload["answer"],
         "outcome": payload["outcome"],
         "fallback": payload.get("fallback"),
         "tools": payload.get("tools", []),
         "cache_hit": payload.get("cache_hit", False),
-        "contexts": await _sources(payload.get("trace_id")),
+        "contexts": conversation_contexts([(message, await _sources(trace)) for message, trace in turns]),
         "grounding": grounding,
         "standalone_query": payload.get("standalone_query", ""),
         "latency_ms": payload.get("latency_ms") or int((time.monotonic() - t0) * 1000),
@@ -164,7 +224,11 @@ def _score_case(trace_id: str | None, checks: dict[str, Any], scores: dict[str, 
                 f"ragas_{metric}",
                 entry["score"],
                 data_type="NUMERIC",
-                metadata={"judges": entry.get("judges"), "spread": entry.get("spread")},
+                metadata={
+                    "judges": entry.get("judges"),
+                    "spread": entry.get("spread"),
+                    "failed": entry.get("failed"),
+                },
             )
 
 
@@ -389,6 +453,48 @@ async def _store(run_id: uuid.UUID, rows: list[dict[str, Any]], n_judges: int) -
         await session.commit()
 
 
+async def _eval_turns(
+    session: Any, source: EvalRun, result: EvalResult
+) -> tuple[list[tuple[str, str | None]], str] | None:
+    """(user message, trace id) per turn of the conversation `source` ran a case in, and its last standalone query.
+
+    Results don't store trace ids, so the conversation is found by the runner's title, persona and time window.
+    """
+    query = (
+        select(Conversation.id)
+        .join(User, User.id == Conversation.user_id)
+        .where(
+            Conversation.title == f"eval {result.case_id}",
+            Conversation.is_eval.is_(True),
+            User.email == result.persona,
+            Conversation.created_at <= result.created_at,
+        )
+        .order_by(Conversation.created_at.desc())
+        .limit(1)
+    )
+    if source.started_at is not None:
+        query = query.where(Conversation.created_at >= source.started_at)
+    conversation_id = (await session.execute(query)).scalar_one_or_none()
+    if conversation_id is None:
+        return None
+    messages = (
+        await session.execute(
+            select(Message)
+            .where(Message.conversation_id == conversation_id)
+            .order_by(Message.created_at, Message.role.desc())
+        )
+    ).scalars()
+    turns: list[tuple[str, str | None]] = []
+    question, standalone = "", ""
+    for m in messages:
+        if m.role == "user":
+            question = m.content
+        else:
+            turns.append((question, str(m.trace_id) if m.trace_id else None))
+            standalone = m.standalone_query or ""
+    return (turns, standalone) if turns else None
+
+
 async def rescore(
     source_run_id: uuid.UUID,
     *,
@@ -413,6 +519,17 @@ async def rescore(
             if r.persona and r.persona not in groundings:
                 user = await get_user_by_email(session, r.persona)
                 groundings[r.persona] = await grounding_for(session, user) if user else [REFERENCE_FACTS]
+        # Follow-ups are judged like `execute` judges them: on the resolved question, with the earlier turns'
+        # sources (runs from before those were stored only kept the last turn's).
+        followups: dict[str, tuple[list[str], str]] = {}
+        for r in stored:
+            if r.error or not (golden.get(r.case_id) or {}).get("prior_turns"):
+                continue
+            found = await _eval_turns(session, source, r)
+            if found:
+                turns, standalone = found
+                contexts = conversation_contexts([(m, await _sources(t)) for m, t in turns])
+                followups[r.case_id] = (contexts, standalone or r.question)
         config = {
             **source.config,
             "rescore_of": str(source_run_id),
@@ -439,21 +556,22 @@ async def rescore(
             return {"case": case, "error": r.error}
         answered = case["expected_outcome"] != "blocked" and bool(r.checks.get("outcome"))
         grounding = groundings.get(r.persona or "", [REFERENCE_FACTS])
+        contexts, question = followups.get(r.case_id, (r.contexts, r.question))
         result: dict[str, Any] = {
             "answer": r.answer,
             "outcome": "answered" if answered else "blocked",
             "tools": [{"tool": t} for t in r.actual_tools],
             "cache_hit": False,
-            "contexts": r.contexts,
+            "contexts": contexts,
             "grounding": grounding,
             "latency_ms": r.latency_ms or 0,
             "cost_usd": float(r.cost_usd or 0),
         }
         scores = (
             await jury.score(
-                question=r.question,
+                question=question,
                 answer=r.answer,
-                contexts=r.contexts,
+                contexts=contexts,
                 reference=case.get("reference", ""),
                 grounding=grounding,
             )
@@ -501,10 +619,11 @@ async def _main(args: argparse.Namespace) -> int:
             await close_redis()
             await dispose()
         return _print_outcome(outcome)
-    estimate = estimate_cost(cases, metrics if not args.no_ragas else (), 0 if args.no_ragas else len(judges))
+    estimate = estimate_cost(cases, () if args.no_ragas else metrics, [] if args.no_ragas else judges)
     print(
         f"Golden suite: {len(cases)} cases · metrics {list(metrics) if not args.no_ragas else 'none'} · "
-        f"judges {judges if not args.no_ragas else 'none'} · estimated cost ≈ ${estimate:.2f}"
+        f"judges {judges if not args.no_ragas else 'none'} · estimated cost ≈ ${estimate['total']:.2f} "
+        f"(agent ${estimate['agent']:.2f} + judges ${estimate['judges']:.2f})"
     )
     if args.dry_run:
         return 0

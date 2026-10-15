@@ -5,11 +5,23 @@ from types import SimpleNamespace
 
 import pandas as pd
 import pytest
+from instructor.core import IncompleteOutputException
 
-from backend.evals.build_golden import in_network, money_re, name_res
+from backend.evals.build_golden import in_network, load, money_re, name_res
 from backend.evals.checks import aggregate, case_checks
-from backend.evals.ragas_jury import Jury
-from backend.evals.run import estimate_cost, flag_disagreement, judged_question, select_cases
+from backend.evals.ragas_jury import Jury, failure_reason, judge_model_args
+from backend.evals.run import (
+    conversation_contexts,
+    estimate_cost,
+    flag_disagreement,
+    judge_weight,
+    judged_question,
+    select_cases,
+    turn_cost,
+)
+
+JURY = ["openai/gpt-5.4-mini", "google/gemini-3.8-flash", "anthropic/claude-haiku-5.5"]
+CORE = ("faithfulness", "answer_relevancy", "context_recall")
 
 ANSWER_CASE = {
     "expected_outcome": "answered",
@@ -93,16 +105,76 @@ def test_aggregate_rates() -> None:
     }
 
 
-def test_cost_estimate_scales_with_cases_and_judges() -> None:
+def test_cost_estimate_scales_with_turns_judges_and_answer_parts() -> None:
     cases = [ANSWER_CASE, {**BLOCK_CASE, "prior_turns": ["hi"]}]
-    no_judges = estimate_cost(cases, (), 0)
-    assert no_judges == pytest.approx(3 * 0.015, abs=0.01)
+    no_judges = estimate_cost(cases, (), [], per_turn=0.01)
+    assert no_judges == {"agent": 0.03, "judges": 0.0, "total": 0.03}  # 3 turns; blocked cases aren't judged
     many = [ANSWER_CASE] * 20
+    single = [{**ANSWER_CASE, "expected_tools": ["sql"]}] * 20
+    follow_ups = [{**ANSWER_CASE, "expected_tools": ["sql"], "prior_turns": ["q"]}] * 20
     assert (
-        estimate_cost(many, ("faithfulness",), 3)
-        > estimate_cost(many, ("faithfulness",), 1)
-        > estimate_cost(many, (), 0)
+        estimate_cost(many, ("faithfulness",), JURY)["judges"]
+        > estimate_cost(many, ("faithfulness",), JURY[:1])["judges"]
+        > estimate_cost(many, (), [])["judges"]
     )
+    assert estimate_cost(many, CORE, JURY)["judges"] > estimate_cost(single, CORE, JURY)["judges"]
+    assert estimate_cost(follow_ups, CORE, JURY)["judges"] > estimate_cost(single, CORE, JURY)["judges"]
+
+
+def test_judge_and_turn_costs_follow_measured_prices() -> None:
+    gemini, gpt, haiku = (judge_weight(j) for j in ("google/x", "openai/x", "anthropic/x"))
+    assert gemini > gpt > haiku
+    assert judge_weight("mistralai/new-judge") == gemini  # unmeasured judges are assumed expensive
+    assert turn_cost(["typesafe/jev-router"] * 3) < turn_cost(
+        ["typesafe/jev-router", "anthropic/claude-sonnet-5.5"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("case_ids", "agent_usd", "judge_usd"),
+    [
+        # run 60d20114: multi-intent, dependent-hop and follow-up cases (5 with a prior turn)
+        (
+            [
+                "mi-01", "mi-02", "mi-03", "mi-04", "mi-05", "dep-01", "dep-02", "dep-03", "dep-04",
+                "memory-01", "memory-02", "memory-03", "memory-04", "memory-05",
+            ],
+            0.080,
+            0.596,
+        ),
+        # run 82775a45: one case per category of the original set (3 of them blocked)
+        (
+            [
+                "plan-01", "prov-01", "policy-01", "member-maria-ded", "multi-01",
+                "memory-01", "oos-01", "inject-01", "xmember-01", "admin-01",
+            ],
+            0.0364,
+            0.2036,
+        ),
+    ],
+)  # fmt: skip
+def test_cost_estimate_covers_recorded_runs(case_ids: list[str], agent_usd: float, judge_usd: float) -> None:
+    golden = {c["id"]: c for c in load()}
+    est = estimate_cost(
+        [golden[i] for i in case_ids], CORE, JURY, per_turn=turn_cost(["typesafe/jev-router"])
+    )
+    assert agent_usd <= est["agent"] <= 2 * agent_usd
+    assert judge_usd <= est["judges"] <= 1.4 * judge_usd  # over-estimates, but not wildly
+
+
+def test_follow_up_contexts_add_earlier_turns_sources() -> None:
+    assert conversation_contexts([]) == []
+    assert conversation_contexts([("What is my deductible?", ["[S1] ded"])]) == ["[S1] ded"]
+    contexts = conversation_contexts(
+        [
+            ("What is my HSA balance?", ["[S1] hsa_balance 2150"]),
+            ("And my claims?", []),
+            ("Is it enough to cover the rest of my deductible?", ["[S1] deductible left 4078.16"]),
+        ]
+    )
+    assert contexts[0] == "[S1] deductible left 4078.16"  # the judged turn's own sources stay first
+    assert len(contexts) == 2 and contexts[1].endswith("\n[S1] hsa_balance 2150")
+    assert "What is my HSA balance?" in contexts[1] and "earlier turn" in contexts[1]
 
 
 def test_disagreement_flag() -> None:
@@ -141,6 +213,79 @@ async def test_jury_aggregates_and_tolerates_failing_judges() -> None:
         "judge-a": 0.8
     }
     assert "context_recall" not in scores  # needs a reference
+    assert scores["answer_relevancy"]["failed"] == {"judge-b": "RuntimeError"}
+    assert "failed" not in scores["faithfulness"]
+
+
+async def test_jury_records_truncated_judges() -> None:
+    jury = Jury(["judge-a", "judge-b"], ("faithfulness",))
+
+    def scorer(value: float | Exception):
+        async def ascore(**_: object) -> SimpleNamespace:
+            if isinstance(value, Exception):
+                raise value
+            return SimpleNamespace(value=value)
+
+        return SimpleNamespace(ascore=ascore)
+
+    jury._scorers = {
+        "judge-a": {"faithfulness": scorer(0.9)},
+        "judge-b": {"faithfulness": scorer(IncompleteOutputException())},
+    }
+    scores = await jury.score(question="q", answer="a", contexts=["[S1] ctx"], reference="")
+    assert scores["faithfulness"] == {
+        "judges": {"judge-a": 0.9},
+        "failed": {"judge-b": "max_tokens"},
+        "score": 0.9,
+        "spread": 0.0,
+    }
+    assert failure_reason(RuntimeError("finish_reason=length: max_tokens reached")) == "max_tokens"
+
+
+async def test_gemini_judges_cap_their_reasoning_on_the_wire() -> None:
+    import importlib
+    import json as _json
+
+    from openai import AsyncOpenAI, DefaultAsyncHttpxClient
+    from pydantic import BaseModel
+    from ragas.llms import llm_factory
+
+    sdk_httpx = importlib.import_module(DefaultAsyncHttpxClient.__mro__[1].__module__.split(".")[0])
+    bodies: list[dict] = []
+
+    def handler(request):  # type: ignore[no-untyped-def]
+        body = _json.loads(request.content)
+        bodies.append(body)
+        message = {"role": "assistant", "content": _json.dumps({"answer": "ok"})}
+        return sdk_httpx.Response(
+            200,
+            json={
+                "id": "x",
+                "object": "chat.completion",
+                "created": 0,
+                "model": body["model"],
+                "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+
+    class Out(BaseModel):
+        answer: str
+
+    client = AsyncOpenAI(
+        api_key="k",
+        base_url="https://openrouter.test/v1",
+        http_client=DefaultAsyncHttpxClient(transport=sdk_httpx.MockTransport(handler)),
+    )
+    for judge in JURY:
+        llm = llm_factory(judge, client=client, adapter="instructor", **judge_model_args(judge))
+        assert (await llm.agenerate("hi", Out)).answer == "ok"
+    await client.close()
+    by_model = {b["model"]: b for b in bodies}
+    assert by_model["google/gemini-3.8-flash"]["reasoning"] == {"effort": "low"}
+    assert "reasoning" not in by_model["anthropic/claude-haiku-5.5"]  # would switch Haiku's thinking on
+    assert "reasoning" not in by_model["openai/gpt-5.4-mini"]
+    assert {b["max_tokens"] for b in bodies} == {8192}
 
 
 def test_select_cases_stratified_sample() -> None:
