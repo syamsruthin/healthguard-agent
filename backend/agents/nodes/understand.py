@@ -105,6 +105,8 @@ async def understand(state: AgentState) -> dict[str, Any]:
         )
     )
     update: dict[str, Any] = {"understanding": u.model_dump(), "plan": plan}
+    if replans and state.get("verification", {}).get("rewrite_mismatch") and u.standalone_query.strip():
+        update["standalone_query"] = u.standalone_query.strip()  # the verifier rejected the first rewrite
     if not replans:
         update["standalone_query"] = u.standalone_query.strip() or message
         update["needs_member_data"] = u.needs_member_data

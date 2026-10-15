@@ -39,6 +39,10 @@ class Verification(BaseModel):
         default_factory=list, description="Harmless imprecision that does not affect groundedness"
     )
     missing: str = Field(default="", description="What is missing, phrased as a follow-up retrieval need")
+    rewrite_mismatch: bool = Field(
+        default=False,
+        description="The QUESTION (standalone rewrite) changed what the user's own message refers to",
+    )
     reason: str = ""
 
 

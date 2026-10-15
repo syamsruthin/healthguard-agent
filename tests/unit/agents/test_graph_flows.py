@@ -262,6 +262,83 @@ async def test_incomplete_answer_triggers_one_replan(fake_llm, tools) -> None:
     assert {c["tag"] for c in final["citations"]} == {"S1", "D1"}
 
 
+MEMORY_01_TURN_1 = (
+    "User: What is my deductible status?\n"
+    "Assistant: You have $700 left on your deductible [S1]. If you'd like, I can also check your "
+    "out-of-pocket maximum progress."
+)
+
+
+async def test_verifier_gets_the_raw_follow_up_message(fake_llm, tools) -> None:
+    llm = fake_llm(
+        {
+            "understand": understanding(
+                [step("s1")], query="How much more do I need to pay before I meet my deductible?"
+            ),
+            "synthesize": "$700 [S1]",
+            "verify": verdict(),
+        }
+    )
+    await run("How much more do I need to pay before I hit it?", recent=MEMORY_01_TURN_1)
+    body = llm.calls[llm.names().index("verify")]["messages"][-1]["content"]
+    assert "<user_message>\nHow much more do I need to pay before I hit it?\n</user_message>" in body
+    assert "<question>\nHow much more do I need to pay before I meet my deductible?\n</question>" in body
+
+
+async def test_verifier_gets_no_raw_message_on_an_opening_question(fake_llm, tools) -> None:
+    llm = fake_llm(
+        {
+            "understand": understanding([step("s1")], query="What is my deductible status?"),
+            "synthesize": "$700 [S1]",
+            "verify": verdict(),
+        }
+    )
+    await run("whats my deductable status")
+    assert "<user_message>" not in llm.calls[llm.names().index("verify")]["messages"][-1]["content"]
+
+
+async def test_rewrite_that_changed_the_subject_is_replanned_and_corrected(fake_llm, tools) -> None:
+    bad, good = (
+        "How much more do I need to pay before I hit my out-of-pocket maximum?",
+        "How much more do I need to pay before I meet my deductible?",
+    )
+    llm = fake_llm(
+        {
+            "understand": [understanding([step("s1")], query=bad), understanding([step("s1")], query=good)],
+            "synthesize": ["$2,300 to your OOP max [S1]", "$700 left on your deductible [S1]"],
+            "verify": [
+                {
+                    **verdict(complete=False, missing="the user asked about the deductible"),
+                    "rewrite_mismatch": True,
+                },
+                verdict(),
+            ],
+        }
+    )
+    final, _ = await run("How much more do I need to pay before I hit it?", recent=MEMORY_01_TURN_1)
+    assert llm.names() == ["understand", "synthesize", "verify", "understand.replan", "synthesize", "verify"]
+    replan_prompt = llm.calls[3]["messages"][-1]["content"]
+    assert "the standalone rewrite changed what the user's message refers to" in replan_prompt
+    assert final["standalone_query"] == good
+    assert f"<question>\n{good}\n</question>" in llm.calls[4]["messages"][-1]["content"]  # 2nd synthesis
+    assert final["answer"] == "$700 left on your deductible [S1]"
+
+
+async def test_replan_keeps_the_rewrite_unless_the_verifier_rejected_it(fake_llm, tools) -> None:
+    fake_llm(
+        {
+            "understand": [
+                understanding([step("s1")], query="first"),
+                understanding([step("s1")], query="second"),
+            ],
+            "synthesize": "Answer [S1]",
+            "verify": [verdict(complete=False, missing="more"), verdict()],
+        }
+    )
+    final, _ = await run("q")
+    assert final["standalone_query"] == "first"
+
+
 async def test_replan_budget_is_respected(fake_llm, tools) -> None:
     llm = fake_llm(
         {
