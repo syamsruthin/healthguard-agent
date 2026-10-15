@@ -9,6 +9,7 @@ from tabulate import tabulate
 from backend.agents.tools.base import ToolResult, UserContext
 from backend.agents.tools.codegen import CodegenTool, Execution, run_codegen
 from backend.agents.tools.sandbox import SandboxError, run_code
+from backend.core import observability as obs
 from backend.llm.prompts.dataframe import build_dataframe_messages
 
 
@@ -41,8 +42,13 @@ def _describe_failure(exc: Exception, code: str) -> tuple[str, str, str]:
 
 
 async def _execute(code: str) -> Execution:
-    result = await run_code(code)
-    formatted, count, truncated = format_result(result)
+    with obs.observe("sandbox.run", input=code) as o:
+        result = await run_code(code)
+        formatted, count, truncated = format_result(result)
+        o.update(
+            output=formatted,
+            metadata={"result_type": result.get("type"), "rows": count, "truncated": truncated},
+        )
     return Execution(result, formatted, count, truncated)
 
 

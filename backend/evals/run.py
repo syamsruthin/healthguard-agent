@@ -11,6 +11,10 @@ dashboards; the semantic cache is off unless `--with-cache`). Answers are then
 scored with deterministic checks and the RAGAS judge jury, results are stored
 in `eval_runs` / `eval_results`, reports are written to `backend/evals/reports/`,
 and the exit code is 1 when the quality gate in `thresholds.yaml` fails.
+
+In Langfuse, every case's turns are tagged `eval` and `eval-run:<run id>`;
+the judging is a second root (`eval:<case id>`) in the judged turn's trace,
+and the RAGAS metrics and deterministic checks are scores on that trace.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ from sqlalchemy import select
 
 from backend.agents.tools import sandbox
 from backend.agents.trace import synthesis_sources
+from backend.core import observability as obs
 from backend.core.config import settings
 from backend.core.logging import configure_logging, get_logger
 from backend.core.redis import close_redis
@@ -140,7 +145,27 @@ async def run_case(case: dict[str, Any]) -> dict[str, Any]:
         "standalone_query": payload.get("standalone_query", ""),
         "latency_ms": payload.get("latency_ms") or int((time.monotonic() - t0) * 1000),
         "cost_usd": round(cost, 6),
+        "trace_id": payload.get("trace_id"),
     }
+
+
+def _score_case(trace_id: str | None, checks: dict[str, Any], scores: dict[str, Any]) -> None:
+    """Deterministic checks and jury metrics as scores on the judged turn's Langfuse trace."""
+    if not trace_id:
+        return
+    lf_trace = obs.trace_id_for(trace_id)
+    for name, value in checks.items():
+        if isinstance(value, bool):
+            obs.score(lf_trace, f"check_{name}", value)
+    for metric, entry in scores.items():
+        if entry.get("score") is not None:
+            obs.score(
+                lf_trace,
+                f"ragas_{metric}",
+                entry["score"],
+                data_type="NUMERIC",
+                metadata={"judges": entry.get("judges"), "spread": entry.get("spread")},
+            )
 
 
 def _gate(metrics: dict[str, float | None]) -> tuple[bool, dict[str, float], list[str]]:
@@ -225,26 +250,39 @@ async def _execute(
         sem = asyncio.Semaphore(concurrency)
 
         async def one(case: dict[str, Any]) -> dict[str, Any]:
-            async with sem:
-                try:
-                    result = await run_case(case)
-                except Exception as exc:
-                    log.exception("eval_case_failed", case=case["id"])
-                    return {"case": case, "error": f"{exc.__class__.__name__}: {exc}"[:500]}
-            checks = case_checks(case, result)
-            scores: dict[str, Any] = {}
-            if (
-                jury is not None
-                and case["expected_outcome"] != "blocked"
-                and result["outcome"] in ("answered", "smalltalk")
+            with obs.propagate(
+                tags=["eval", f"eval-run:{run_id}"],
+                metadata={"eval_run_id": run_id, "eval_case": case["id"], "eval_category": case["category"]},
             ):
-                scores = await jury.score(
-                    question=judged_question(case, result),
-                    answer=result["answer"],
-                    contexts=result["contexts"],
-                    reference=case.get("reference", ""),
-                    grounding=result.get("grounding", []),
-                )
+                async with sem:
+                    try:
+                        result = await run_case(case)
+                    except Exception as exc:
+                        log.exception("eval_case_failed", case=case["id"])
+                        return {"case": case, "error": f"{exc.__class__.__name__}: {exc}"[:500]}
+                checks = case_checks(case, result)
+                scores: dict[str, Any] = {}
+                if (
+                    jury is not None
+                    and case["expected_outcome"] != "blocked"
+                    and result["outcome"] in ("answered", "smalltalk")
+                ):
+                    with obs.observe(
+                        f"eval:{case['id']}",
+                        as_type="evaluator",
+                        trace_id=obs.trace_id_for(result["trace_id"]) if result.get("trace_id") else None,
+                        input={"question": judged_question(case, result), "reference": case.get("reference")},
+                        metadata={"metrics": list(metrics), "judges": judges},
+                    ) as judging:
+                        scores = await jury.score(
+                            question=judged_question(case, result),
+                            answer=result["answer"],
+                            contexts=result["contexts"],
+                            reference=case.get("reference", ""),
+                            grounding=result.get("grounding", []),
+                        )
+                        judging.update(output={m: e.get("score") for m, e in scores.items()})
+                _score_case(result.get("trace_id"), checks, scores)
             return {"case": case, "result": result, "checks": checks, "scores": scores}
 
         rows = await asyncio.gather(*(one(c) for c in cases))
@@ -459,6 +497,7 @@ async def _main(args: argparse.Namespace) -> int:
         try:
             outcome = await rescore(uuid.UUID(args.rescore), metrics=metrics, judges=judges)
         finally:
+            obs.shutdown()
             await close_redis()
             await dispose()
         return _print_outcome(outcome)
@@ -482,6 +521,7 @@ async def _main(args: argparse.Namespace) -> int:
         )
     finally:
         sandbox.shutdown()
+        obs.shutdown()
         await close_redis()
         await dispose()
     return _print_outcome(outcome)

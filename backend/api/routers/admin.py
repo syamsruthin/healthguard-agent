@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import timedelta
 from typing import Any
@@ -10,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import require_admin
+from backend.core import observability as obs
 from backend.core.errors import ConflictError, NotFoundError
 from backend.db.base import utcnow
 from backend.db.models import EvalRun, Trace, User
@@ -39,6 +41,8 @@ async def get_trace(trace_id: uuid.UUID, session: AsyncSession = Depends(get_ses
         "total_ms": trace.total_ms,
         "created_at": trace.created_at.isoformat(),
         "steps": trace.steps,
+        # The project id behind the URL is fetched once (blocking SDK call), then cached.
+        "langfuse_url": await asyncio.to_thread(obs.trace_url, trace.id) if obs.enabled() else None,
     }
 
 

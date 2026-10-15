@@ -26,6 +26,7 @@ from backend.agents.runner import run_graph
 from backend.agents.state import initial_state
 from backend.agents.tools import sandbox
 from backend.cache.semantic import maybe_store
+from backend.core import observability
 from backend.core.logging import configure_logging
 from backend.core.redis import close_redis
 from backend.db.session import SessionLocal, dispose, get_data_version
@@ -82,7 +83,19 @@ async def _run(args: argparse.Namespace) -> int:
                     recent_turns="\n".join(history[-6:]),
                     data_version=data_version,
                 )
-                final = await run_graph(graph, state, thread_id=conversation_id, sink=_printer(args.verbose))
+                with (
+                    observability.propagate(
+                        user_id=ctx.user_id,
+                        session_id=conversation_id,
+                        trace_name="chat-turn",
+                        tags=["chat", "cli"],
+                    ),
+                    observability.observe("chat-turn", as_type="agent", input={"message": question}) as root,
+                ):
+                    final = await run_graph(
+                        graph, state, thread_id=conversation_id, sink=_printer(args.verbose)
+                    )
+                    root.update(output=final.get("answer"), metadata={"outcome": final.get("outcome")})
                 if final.get("cache_hit") or final.get("fallback"):
                     print(final.get("answer", ""))
                 stored = await maybe_store(final, ctx)
@@ -120,6 +133,7 @@ async def _main(args: argparse.Namespace) -> int:
         return await _run(args)
     finally:
         sandbox.shutdown()
+        observability.shutdown()  # flush the turn traces before exit
         await close_redis()
         await dispose()
 

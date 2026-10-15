@@ -21,6 +21,7 @@ from backend.agents.tools.dataframe_tool import run_dataframe_tool
 from backend.agents.tools.rag_tool import run_policy_search
 from backend.agents.tools.sql_tool import run_sql_tool
 from backend.agents.trace import append, emit, step, traced
+from backend.core import observability as obs
 from backend.core.config import settings
 from backend.core.logging import get_logger
 
@@ -41,6 +42,32 @@ def _failure(s: dict[str, Any], error: str, code: str) -> dict[str, Any]:
 
 
 async def _run_step(s: dict[str, Any], user: UserContext, done: list[dict[str, Any]]) -> dict[str, Any]:
+    with obs.observe(
+        f"{s['id']} · {s['tool']}",
+        as_type="tool",
+        input={"task": s["task"], "depends_on": s.get("depends_on", [])},
+        metadata={"step_id": s["id"], "tool": s["tool"]},
+    ) as o:
+        out = await _run_step_inner(s, user, done)
+        o.update(
+            output=out.get("formatted") or out.get("error"),
+            metadata={
+                "ok": out["ok"],
+                "rows": out.get("row_count", 0),
+                "truncated": out.get("truncated"),
+                "attempts": out.get("attempts", 1),
+                "duration_ms": out.get("duration_ms", 0),
+                "error_code": out.get("error_code"),
+                "code": out.get("code"),
+                "chunks": [c.get("chunk_id") for c in out.get("chunks", [])],
+            },
+        )
+        if not out["ok"]:
+            o.fail(f"{out.get('error_code')}: {out.get('error')}", level="WARNING")
+        return out
+
+
+async def _run_step_inner(s: dict[str, Any], user: UserContext, done: list[dict[str, Any]]) -> dict[str, Any]:
     emit({"type": "tool", "step_id": s["id"], "tool": s["tool"], "task": s["task"], "status": "running"})
     ok_ids = {r["step_id"] for r in done if r.get("ok")}
     failed_deps = [d for d in s.get("depends_on", []) if d not in ok_ids]
@@ -75,14 +102,15 @@ async def _run_step(s: dict[str, Any], user: UserContext, done: list[dict[str, A
     return out
 
 
-@traced("execute", "Looking up the information")
+@traced("execute", "Looking up the information", as_type="chain")
 async def execute(state: AgentState) -> dict[str, Any]:
     t0 = time.monotonic()
     user = UserContext.from_dict(state["user"])
     results = list(state.get("results", []))  # earlier replan rounds stay available to synthesis
     round_results: list[dict[str, Any]] = []
     levels = plan_levels(state.get("plan", []))
-    for level in levels:
+    for i, level in enumerate(levels):
+        obs.event("plan.level", output=[f"{s['id']}:{s['tool']}" for s in level], level=i)
         outs = await asyncio.gather(*(_run_step(s, user, results) for s in level))
         results.extend(outs)
         round_results.extend(outs)

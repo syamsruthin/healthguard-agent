@@ -180,6 +180,7 @@ def _stream_turn(api: Any, prompt: str) -> None:
                     "verification": final.get("verification"),
                     "usage": final.get("usage"),
                     "plan": final.get("plan", []),
+                    "langfuse_url": final.get("langfuse_url"),
                 },
             }
         )

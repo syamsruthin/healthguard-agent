@@ -29,7 +29,7 @@ def _recent(history: str, budget: int = _VERIFY_HISTORY_TOKENS) -> str:
     return history[-budget * 4 :]
 
 
-@traced("verify", "Double-checking the answer")
+@traced("verify", "Double-checking the answer", as_type="evaluator")
 async def verify(state: AgentState) -> dict[str, Any]:
     t0 = time.monotonic()
     user = UserContext.from_dict(state["user"])

@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.api.deps import feedback_rate_limit, get_current_user
 from backend.api.schemas import FeedbackIn
+from backend.core import observability as obs
 from backend.core.errors import NotFoundError
 from backend.db.models import Feedback, Message, User
 from backend.db.session import get_session
@@ -39,5 +40,14 @@ async def give_feedback(
         )
     )
     await session.commit()
+    if msg.trace_id is not None:  # the turn's Langfuse trace shares the message's trace id
+        obs.score(
+            obs.trace_id_for(msg.trace_id),
+            "user_feedback",
+            float(body.rating),
+            data_type="NUMERIC",
+            comment=body.comment,
+            metadata={"message_id": str(message_id)},
+        )
     if body.rating < 0:  # every thumbs-down gets judged
         await get_enqueuer().enqueue("online_eval", str(message_id), "thumbs_down", job_id=f"oe:{message_id}")

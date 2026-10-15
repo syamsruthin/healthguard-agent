@@ -41,7 +41,7 @@ The **admin dashboards** (Streamlit) read aggregates over these tables: latency 
 
 | Option | Why not (here) |
 |---|---|
-| LangSmith / Langfuse | Good products; a hosted dependency for core audit data; the in-database trace keeps everything next to the message and under the same access control. Easy to add as an OTel exporter later |
+| LangSmith / Langfuse | Good products; a hosted dependency for core audit data; the in-database trace keeps everything next to the message and under the same access control. Langfuse was later added *alongside* these signals, not instead of them: see [ADR-0040](0040-langfuse-llm-observability.md) |
 | Logs only | Hard to aggregate cost and latency; no structure for the UI |
 | Compute cost from a local price table | Goes stale; routers bill at the serving model's price, which only the provider knows |
 

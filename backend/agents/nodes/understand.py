@@ -11,6 +11,7 @@ from backend.agents.state import AgentState
 from backend.agents.tools.base import UserContext
 from backend.agents.trace import append, emit, step, traced
 from backend.cache.semantic import cache_scope
+from backend.core import observability as obs
 from backend.core.config import settings
 from backend.core.logging import get_logger
 from backend.core.telemetry import GUARDRAIL_BLOCKS
@@ -47,15 +48,19 @@ def _block(state: AgentState, reason: str, t0: float, *, layer: str, rationale: 
     }
 
 
-@traced("understand", "Understanding your question")
+@traced("understand", "Understanding your question", as_type="agent")
 async def understand(state: AgentState) -> dict[str, Any]:
     t0 = time.monotonic()
     user = UserContext.from_dict(state["user"])
     replans = state.get("replans", 0)
     message = state["message"]
 
-    if not replans and (reason := prefilter(message, user)):
-        return _block(state, reason, t0, layer="prefilter")
+    if not replans:
+        with obs.observe("guardrail.prefilter", as_type="guardrail", input=message) as g:
+            reason = prefilter(message, user)
+            g.update(output={"blocked": bool(reason), "reason": reason})
+        if reason:
+            return _block(state, reason, t0, layer="prefilter")
 
     messages = build_understand_messages(
         profile=user.profile_text(),
@@ -82,6 +87,11 @@ async def understand(state: AgentState) -> dict[str, Any]:
         }
 
     reason = u.safety if u.safety != "ok" else (None if u.in_scope else "out_of_scope")
+    obs.event(
+        "guardrail.llm",
+        output={"safety": u.safety, "in_scope": u.in_scope, "blocked": bool(reason) and not replans},
+        reasoning=u.reason,
+    )
     if reason and not replans:
         return _block(state, reason, t0, layer="llm", rationale=u.reason)
 

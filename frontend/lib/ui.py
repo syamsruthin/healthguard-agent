@@ -105,6 +105,8 @@ def reasoning(meta: dict[str, Any], trace: list[dict[str, Any]] | None = None) -
                 )
                 for claim in verification.get("unsupported_claims") or []:
                     st.caption(md(f"Unsupported: {claim}"))
+        if meta.get("langfuse_url"):
+            st.link_button("Open in Langfuse", meta["langfuse_url"], icon=":material/open_in_new:")
         if trace:
             st.markdown("**Trace**")
             for s in trace:

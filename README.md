@@ -174,7 +174,7 @@ flowchart TD
 | Data | pandas, NumPy, Faker (synthetic generation) |
 | UI | Streamlit 1.65 (`st.navigation`), Plotly |
 | Evaluation | RAGAS 0.4.3 (collections metrics) |
-| Observability | structlog (PII masking), Prometheus, OpenTelemetry (OTLP / Jaeger) |
+| Observability | structlog (PII masking), Prometheus, OpenTelemetry (OTLP / Jaeger), Langfuse (SDK v5) |
 | Delivery | Docker (multi-stage, non-root), Docker Compose, GitHub Actions |
 
 ---
@@ -407,6 +407,8 @@ Settings are read from environment variables (or `.env`) by `backend/core/config
 | `SEMANTIC_CACHE_TTL_PUBLIC_SECONDS` / `SEMANTIC_CACHE_TTL_MEMBER_SECONDS` | `86400` / `3600` | |
 | `JUDGE_DISAGREEMENT_THRESHOLD` | `0.3` | Flags eval cases where judges disagree |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | Enables OpenTelemetry export (for example `http://localhost:4318`) |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `LANGFUSE_BASE_URL` | — / — / `https://cloud.langfuse.com` | Langfuse tracing, on when both keys are set (`LANGFUSE_ENABLED=false` forces it off) |
+| `LANGFUSE_CAPTURE_IO` / `LANGFUSE_MAX_FIELD_CHARS` / `LANGFUSE_SAMPLE_RATE` | `true` / `6000` / `1.0` | Send masked prompts and outputs (or metadata only) / per-value size limit / share of traces exported |
 
 ---
 
@@ -496,6 +498,12 @@ Measured on the live demo. The first five rows used fixed Claude models; the las
   - HTTP metrics
   - Run one uvicorn worker per container, because counters are per process.
 - **OpenTelemetry.** Set `OTEL_EXPORTER_OTLP_ENDPOINT` to export spans for FastAPI, SQLAlchemy, httpx, each graph node (`agent.*`) and each LLM call (`llm.complete` / `llm.stream`, with model, tokens and cost). `docker compose --profile observability up -d` adds Jaeger.
+- **Langfuse** ([ADR-0040](docs/adr/0040-langfuse-llm-observability.md)). Set `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` (and `LANGFUSE_BASE_URL` for a non-EU or self-hosted instance). Each turn is one trace whose id is the turn's `trace_id`, with user = user id and session = conversation:
+  - `chat-turn` → `load-context` / `memory.search` → one observation per graph node → tool steps → codegen attempts → `sql.guard` / `sql.execute` / `sandbox.run`, retrieval stages (`hybrid_search`, `vector_search`, `keyword_search`, `rrf_fusion`), guardrails, semantic-cache lookups and stores, `persist`, enqueued follow-ups;
+  - a generation per model call with messages, output, requested vs served model, prompt-cache reads / writes and OpenRouter's reported cost (time to first token for the streamed answer);
+  - scores: `outcome`, `fallback`, `cache_hit`, `grounded`, `complete`, `replans`, `revisions`, `user_feedback` (thumbs), `online_faithfulness` / `online_relevancy` (jury), and `ragas_*` / `check_*` from `hg-eval`;
+  - worker jobs are `job:<name>` traces in the same session; eval turns are tagged `eval` and `eval-run:<id>`;
+  - inputs, outputs and metadata are PII-masked and size-limited; `LANGFUSE_CAPTURE_IO=false` sends metadata, usage and scores only. Admins get an **Open in Langfuse** link under each answer.
 - **Structured logs.** structlog with request, user, conversation and trace IDs bound to every line; JSON in containers.
 
 ---

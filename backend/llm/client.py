@@ -22,12 +22,14 @@ import re
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Protocol, TypeVar
 
 import openai
 from openai import AsyncOpenAI
 from pydantic import BaseModel, ValidationError
 
+from backend.core import observability as obs
 from backend.core.config import settings
 from backend.core.errors import UpstreamError
 from backend.core.logging import get_logger
@@ -128,6 +130,64 @@ def _is_openrouter() -> bool:
     return "openrouter.ai" in settings.llm_base_url
 
 
+def start_generation(
+    role: Role,
+    name: str,
+    spec: ModelSpec,
+    messages: list[Msg],
+    *,
+    temperature: float,
+    max_tokens: int,
+    response_format: dict[str, Any] | None = None,
+    stream: bool = False,
+) -> obs.Observation:
+    """The Langfuse generation for one model call, nested under the current observation."""
+    schema = (response_format or {}).get("json_schema", {}).get("name")
+    return obs.start(
+        f"llm.{name}",
+        as_type="generation",
+        input=[{"role": m["role"], "content": m["content"]} for m in messages],
+        model=spec.model,
+        model_parameters={
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            **({"response_format": str(schema)} if schema else {}),
+        },
+        metadata={
+            "role": role.value,
+            "call": name,
+            "requested_model": spec.model,
+            "fallbacks": spec.fallbacks,
+            "router": is_router(spec.model),
+            "prompt_version": PROMPT_VERSION,
+            "prompt_cache_breakpoints": sum(1 for m in messages if m.get("cache")),
+            "stream": stream,
+        },
+    )
+
+
+def end_generation(
+    gen: obs.Observation,
+    *,
+    output: str,
+    served: str,
+    usage: dict[str, Any],
+    latency_ms: int,
+    error: BaseException | str | None = None,
+    **metadata: Any,
+) -> None:
+    gen.update(
+        output=output,
+        model=served,
+        usage_details=obs.usage_details(usage),
+        cost_details=obs.cost_details(usage),
+        metadata={"served_model": served, "latency_ms": latency_ms, **metadata},
+    )
+    if error is not None:
+        gen.fail(error)
+    gen.end()
+
+
 class OpenRouterClient:
     def __init__(self) -> None:
         self._client = AsyncOpenAI(
@@ -188,6 +248,22 @@ class OpenRouterClient:
             hit = await llm_cache.get(key)
             if hit:
                 record(LLMCallRecord(role=role.value, name=name, model=hit["model"], exact_cache_hit=True))
+                end_generation(
+                    start_generation(
+                        role,
+                        name,
+                        spec,
+                        messages,
+                        temperature=temp,
+                        max_tokens=mtok,
+                        response_format=response_format,
+                    ),
+                    output=hit["text"],
+                    served=hit["model"],
+                    usage={"cost_usd": 0.0},
+                    latency_ms=0,
+                    exact_cache_hit=True,
+                )
                 return LLMResult(text=hit["text"], model=hit["model"], usage={}, cached=True, cache_key=key)
 
         self._check_configured()
@@ -206,6 +282,10 @@ class OpenRouterClient:
         llm_span = start_span(
             "llm.complete", llm_role=role.value, llm_call=name, llm_requested_model=spec.model
         )
+        gen = start_generation(
+            role, name, spec, messages, temperature=temp, max_tokens=mtok, response_format=response_format
+        )
+        prompt_only_json = False
         try:
             try:
                 resp = await self._client.chat.completions.create(**kwargs)
@@ -213,8 +293,17 @@ class OpenRouterClient:
                 if not response_format:
                     raise
                 kwargs.pop("response_format")  # provider lacks structured outputs → prompt-only JSON
+                prompt_only_json = True
                 resp = await self._client.chat.completions.create(**kwargs)
         except openai.OpenAIError as exc:
+            end_generation(
+                gen,
+                output="",
+                served=spec.model,
+                usage={},
+                latency_ms=int((time.monotonic() - t0) * 1000),
+                error=exc,
+            )
             LLM_ERRORS.labels(role=role.value).inc()
             record(
                 LLMCallRecord(
@@ -235,6 +324,16 @@ class OpenRouterClient:
         usage = parse_usage(getattr(resp, "usage", None))
         record(LLMCallRecord(role=role.value, name=name, model=served, latency_ms=latency, **usage))
         end_llm_span(llm_span, model=served, usage=usage)
+        end_generation(
+            gen,
+            output=text,
+            served=served,
+            usage=usage,
+            latency_ms=latency,
+            error="empty completion" if not text else None,
+            finish_reason=resp.choices[0].finish_reason if resp.choices else None,
+            prompt_only_json=prompt_only_json or None,
+        )
         if key and text:
             await llm_cache.put(key, {"text": text, "model": served})
         return LLMResult(text=text, model=served, usage=usage, cache_key=key if text else None)
@@ -267,6 +366,7 @@ class OpenRouterClient:
             return schema.model_validate_json(extract_json(result.text))
         except (ValueError, ValidationError) as exc:
             log.info("structured_output_repair", call=name, error=str(exc)[:200])
+            obs.event("structured_output.invalid", output=str(exc)[:500], call=name, schema=schema.__name__)
             await llm_cache.forget(result.cache_key)  # never replay output that failed the schema
             repair = [
                 *messages,
@@ -294,6 +394,7 @@ class OpenRouterClient:
             try:
                 parsed = schema.model_validate_json(extract_json(fixed.text))
             except (ValueError, ValidationError) as exc2:
+                obs.event("structured_output.repair_failed", output=str(exc2)[:500], call=name)
                 raise LLMError(f"LLM call '{name}' returned invalid structured output") from exc2
             if result.cache_key:  # the original request now replays the repaired, valid output
                 await llm_cache.put(result.cache_key, {"text": fixed.text, "model": fixed.model})
@@ -328,8 +429,19 @@ class OpenRouterClient:
         error: str | None = None
         resp: Any = None
         completed = False
+        parts: list[str] = []
         llm_span = start_span(
             "llm.stream", llm_role=role.value, llm_call=name, llm_requested_model=spec.model
+        )
+        # Not made current: it stays open across `yield`, where the consumer's context is active.
+        gen = start_generation(
+            role,
+            name,
+            spec,
+            messages,
+            temperature=kwargs["temperature"],
+            max_tokens=kwargs["max_tokens"],
+            stream=True,
         )
         try:
             resp = await self._client.chat.completions.create(**kwargs)
@@ -338,6 +450,9 @@ class OpenRouterClient:
                 if chunk.choices:
                     delta = chunk.choices[0].delta.content
                     if delta:
+                        if not parts:
+                            gen.update(completion_start_time=datetime.now(UTC))  # time to first token
+                        parts.append(delta)
                         yield delta
                 if getattr(chunk, "usage", None):
                     usage = parse_usage(chunk.usage)
@@ -357,6 +472,14 @@ class OpenRouterClient:
                     except Exception as close_exc:
                         log.debug("llm_stream_close_failed", error=str(close_exc)[:200])
             end_llm_span(llm_span, model=served, usage=usage, error=error)
+            end_generation(
+                gen,
+                output="".join(parts),
+                served=served,
+                usage=usage,
+                latency_ms=int((time.monotonic() - t0) * 1000),
+                error=error,
+            )
             record(
                 LLMCallRecord(
                     role=role.value,

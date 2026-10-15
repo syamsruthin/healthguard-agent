@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.core import observability as obs
 from backend.core.config import settings
 from backend.core.logging import get_logger
 from backend.core.tokens import count_tokens
@@ -94,12 +95,18 @@ async def build_context(
     _, window = split_window(lines, settings.history_token_budget)
     memories = ""
     if user.memory_enabled:
-        try:
-            if await has_memories(session, user.id):  # no embedding call for users with nothing stored
-                vector = await embed_query(normalize_query(message))  # same text as the cache key
-                memories = format_memories(await search(session, user.id, vector))
-        except Exception as exc:  # memory is an enhancement; never fail the turn for it
-            log.warning("memory_search_failed", error=str(exc)[:200])
+        with obs.observe("memory.search", as_type="retriever", input=message) as o:
+            try:
+                if await has_memories(session, user.id):  # no embedding call for users with nothing stored
+                    vector = await embed_query(normalize_query(message))  # same text as the cache key
+                    found = await search(session, user.id, vector)
+                    memories = format_memories(found)
+                    o.update(output=memories, metadata={"found": len(found)})
+                else:
+                    o.update(output="(no stored memories)")
+            except Exception as exc:  # memory is an enhancement; never fail the turn for it
+                log.warning("memory_search_failed", error=str(exc)[:200])
+                o.fail(exc, level="WARNING")
     return MemoryContext(
         recent_turns="\n".join(window), summary=conversation.summary or "", memories=memories, lines=lines
     )

@@ -152,6 +152,15 @@ class Settings(BaseSettings):
     # ── Observability ────────────────────────────────────────────────────
     otel_exporter_otlp_endpoint: str = ""
     otel_service_name: str = "healthguard-api"
+    # Langfuse LLM tracing: on when both keys are set (LANGFUSE_ENABLED=false forces it off).
+    langfuse_enabled: bool = True
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_base_url: str = "https://cloud.langfuse.com"
+    langfuse_sample_rate: float = 1.0  # share of traces exported
+    langfuse_capture_io: bool = True  # false = metadata, usage and scores only (no prompts / answers / rows)
+    langfuse_max_field_chars: int = 6_000  # per input / output / metadata value, after PII masking
+    langfuse_debug: bool = False
 
     # ── Paths ────────────────────────────────────────────────────────────
     data_dir: Path = BACKEND_DIR / "data"
@@ -203,6 +212,10 @@ class Settings(BaseSettings):
         scheme, rest = base.split("://", 1)
         hostpart = rest.split("@", 1)[1] if "@" in rest else rest
         return f"{scheme}://{self.agent_db_user}:{self.agent_db_password}@{hostpart}"
+
+    @property
+    def langfuse_configured(self) -> bool:
+        return self.langfuse_enabled and bool(self.langfuse_public_key and self.langfuse_secret_key)
 
     @property
     def llm_enabled(self) -> bool:

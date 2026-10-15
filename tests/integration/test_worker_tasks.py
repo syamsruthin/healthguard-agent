@@ -145,3 +145,37 @@ async def test_online_eval_jury(convo, fake_llm, monkeypatch: pytest.MonkeyPatch
     calls = len(llm.calls)
     assert await tasks.online_eval({}, str(convo["answer"]), "thumbs_down") is None  # judged once only
     assert len(llm.calls) == calls
+
+
+async def test_jobs_are_traced_and_jury_scores_the_turn_trace(
+    convo, fake_llm, monkeypatch: pytest.MonkeyPatch, langfuse_spans
+) -> None:
+    from backend.core import observability as obs
+    from tests.langfuse_tree import collect
+
+    sent: list[dict] = []
+    monkeypatch.setattr(obs.get_langfuse(), "create_score", lambda **kw: sent.append(kw))
+    monkeypatch.setattr(settings, "online_eval_judges", ["openai/judge-a", "google/judge-b"])
+    fake_llm(
+        {
+            "online_eval": [{"faithfulness": 1.0, "relevancy": 0.8}, {"faithfulness": 0.6, "relevancy": 1.0}],
+            "title": {"title": "Cardiologist search"},
+        }
+    )
+    await tasks.title_conversation({}, str(convo["conversation"]))
+    await tasks.online_eval({}, str(convo["answer"]), "thumbs_down")
+
+    title, judged = collect(langfuse_spans)
+    assert title.name == "job:title" and title.attrs["session.id"] == str(convo["conversation"])
+    assert title.child("llm.title").type == "generation" and title.output == "Cardiologist search"
+    assert judged.name == "job:online_eval" and judged.meta("reason") is None
+    assert sorted(judged.child_names()) == ["judge · google/judge-b", "judge · openai/judge-a"]
+    assert judged.child("judge · openai/judge-a").type == "evaluator"
+
+    async with SessionLocal() as session:
+        turn_trace = obs.trace_id_for((await session.get(Message, convo["answer"])).trace_id)
+    assert judged.meta("turn_trace_id") == turn_trace
+    by_name = {s["name"]: s for s in sent}
+    assert by_name["online_faithfulness"]["trace_id"] == turn_trace
+    assert by_name["online_faithfulness"]["value"] == pytest.approx(0.8)
+    assert by_name["online_relevancy"]["metadata"]["spread"] == pytest.approx(0.2)
