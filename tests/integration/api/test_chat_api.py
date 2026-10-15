@@ -7,6 +7,7 @@ import uuid
 from sqlalchemy import func, select
 
 from backend.agents.graph import get_graph
+from backend.core.config import settings
 from backend.core.redis import get_redis
 from backend.db.models import EvalRun, LLMCall, Message, Trace
 from backend.db.session import SessionLocal
@@ -36,7 +37,9 @@ async def _conversation(client, tokens) -> str:
     return resp.json()["id"]
 
 
-async def test_streamed_turn_contract_and_persistence(client, fake_llm, jobs) -> None:
+async def test_streamed_turn_contract_and_persistence(client, fake_llm, jobs, monkeypatch) -> None:
+    # Answered turns are sampled for online evaluation (5 % by default); pin it so the job set is deterministic.
+    monkeypatch.setattr(settings, "online_eval_sample_rate", 0.0)
     fake_llm(script())
     tokens = await login(client, "maria.garcia@demo.healthguard.dev")
     cid = await _conversation(client, tokens)
