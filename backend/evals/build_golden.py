@@ -499,7 +499,13 @@ async def multi_intent_cases() -> list[Case]:
         "WHERE member_id = :m AND provider_specialty = 'Physical Therapy'",
         m=maria.member_id,
     )
-    pt_limit = 30  # corpus 16_therapies_dme.md: combined PT/OT rehabilitation visits per plan year
+    # The plan's own benefit row (also in corpus 16_therapies_dme.md: 30 combined PT/OT visits per plan year).
+    pt_benefit = await _one(
+        "SELECT b.visit_limit FROM insurance.members m JOIN insurance.plan_benefits b USING (plan_id) "
+        "WHERE m.member_id = :m AND b.service_category = 'Physical & occupational therapy'",
+        m=maria.member_id,
+    )
+    pt_limit = int(pt_benefit["visit_limit"])
     oop = await _one(
         "SELECT oop_individual_met, oop_individual_limit FROM insurance.member_accumulators WHERE member_id = :m",
         m=robert.member_id,
@@ -520,7 +526,9 @@ async def multi_intent_cases() -> list[Case]:
                 f"remain. In-network ({nets['maria']}) physical therapists in {maria.city}, {maria.state} accepting "
                 f"new patients: {names(pt)}."
             ),
-            expected_tools=["sql", "policy_search", "providers"],
+            # The visit limit is a structured plan benefit (insurance.plan_benefits), so SQL answers it; policy
+            # text is accepted too (the route check is a subset test) but not required.
+            expected_tools=["sql", "providers"],
             must_include=[rf"\b{pt_visits['n']}\b", rf"\b{pt_limit}\b", *name_res(pt)],
             forbidden_ids=forbidden_for(maria.member_id),
         ),
@@ -576,7 +584,8 @@ async def multi_intent_cases() -> list[Case]:
                 f"${oop['oop_individual_limit']:,.2f} individual out-of-pocket maximum, so covered in-network care "
                 "costs you $0 for the rest of the plan year."
             ),
-            expected_tools=["providers", "sql", "policy_search"],
+            # OOP status and the visit copay are both in SQL (member_accumulators, plan_benefits).
+            expected_tools=["providers", "sql"],
             must_include=[
                 *name_res(cardio),
                 money_re(float(oop["oop_individual_limit"])),

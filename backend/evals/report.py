@@ -79,6 +79,14 @@ def write_reports(
             )
     if summary.get("flagged"):
         lines += ["", f"Judge disagreement flagged on: {', '.join(summary['flagged'])}"]
+    lost = [
+        f"{r['case']['id']} {metric} · {judge}: {reason}"
+        for r in rows
+        for metric, entry in (r.get("scores") or {}).items()
+        for judge, reason in (entry.get("failed") or {}).items()
+    ]
+    if lost:
+        lines += ["", f"Judge scores lost ({len(lost)}):", "", *(f"- {item}" for item in lost)]
     path = stem.with_suffix(".md")
     path.write_text("\n".join(lines) + "\n")
     return path

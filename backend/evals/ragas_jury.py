@@ -2,8 +2,8 @@
 RAGAS scoring with a jury of judges from different model families.
 
 Every metric is scored once per judge (EVAL_JUDGES, via OpenRouter); the case
-score is the mean over the judges that succeeded, and the spread (max − min)
-flags disagreement. Judge responses are cached on disk, so re-running
+score is the mean over the judges that succeeded, the spread (max − min)
+flags disagreement, and `failed` says why a judge has no score. Judge responses are cached on disk, so re-running
 unchanged cases costs nothing. RAGAS calls OpenRouter with its own client, so
 a response hook (`SpendMeter`) adds up the cost OpenRouter reports per call
 and records each judge call as a Langfuse generation under its metric.
@@ -20,6 +20,7 @@ from pathlib import Path
 from statistics import mean
 from typing import Any
 
+from instructor.core import IncompleteOutputException
 from openai import AsyncOpenAI, DefaultAsyncHttpxClient
 from ragas.cache import DiskCacheBackend
 from ragas.embeddings import OpenAIEmbeddings
@@ -47,6 +48,27 @@ ALL_METRICS = (
 CORE_METRICS = ("faithfulness", "answer_relevancy", "context_recall")  # cheapest informative set
 CACHE_DIR = Path(__file__).parent / ".cache"
 JUDGE_MAX_TOKENS = 8192  # long answers produce long claim lists (4,096 still truncated 2 of 21 calls)
+# Hidden reasoning counts against max_tokens. In run 60d20114 both truncated calls were Gemini faithfulness
+# verdicts on long multi-part answers: 8,185 output tokens, of which under 1,000 were the visible JSON. A
+# bigger cap would only buy more thinking (Gemini was already 60% of the judge bill), so its effort is capped.
+# GPT barely reasons on these prompts and Haiku doesn't by default (a reasoning setting would switch it on).
+JUDGE_REASONING: dict[str, dict[str, str]] = {"google/": {"effort": "low"}}
+
+
+def judge_model_args(judge: str) -> dict[str, Any]:
+    """Model arguments for a judge's calls (OpenRouter's `reasoning` goes in the request body)."""
+    args: dict[str, Any] = {"max_tokens": JUDGE_MAX_TOKENS}
+    reasoning = next((r for prefix, r in JUDGE_REASONING.items() if judge.startswith(prefix)), None)
+    if reasoning:
+        args["extra_body"] = {"reasoning": reasoning}
+    return args
+
+
+def failure_reason(exc: Exception) -> str:
+    """A short label for why a judge produced no score ("max_tokens" when its output was cut off)."""
+    if isinstance(exc, IncompleteOutputException) or "max_tokens" in str(exc):
+        return "max_tokens"
+    return exc.__class__.__name__
 
 
 class SpendMeter:
@@ -131,7 +153,7 @@ class Jury:
             # output budget because faithfulness lists every claim (the default cap truncated long answers).
             cache = DiskCacheBackend(str(CACHE_DIR / re.sub(r"[^a-z0-9]+", "_", judge.lower())))
             llm = llm_factory(
-                judge, client=client, adapter="instructor", cache=cache, max_tokens=JUDGE_MAX_TOKENS
+                judge, client=client, adapter="instructor", cache=cache, **judge_model_args(judge)
             )
             self._scorers[judge] = {
                 "faithfulness": Faithfulness(llm=llm),
@@ -162,7 +184,8 @@ class Jury:
             return {"response": a, "reference": ref} if ref else None
         return None
 
-    async def _one(self, judge: str, metric: str, kwargs: dict[str, Any]) -> float | None:
+    async def _one(self, judge: str, metric: str, kwargs: dict[str, Any]) -> float | str | None:
+        """The judge's score, or why it failed (None when the metric returned no value)."""
         async with self._sem:
             with obs.observe(
                 f"{metric} · {judge}", as_type="evaluator", metadata={"metric": metric, "judge": judge}
@@ -173,9 +196,12 @@ class Jury:
                     o.update(output=value, metadata={"reason": getattr(result, "reason", None)})
                     return value
                 except Exception as exc:  # one failing judge / metric must not abort the run
-                    log.warning("judge_metric_failed", judge=judge, metric=metric, error=str(exc)[:200])
+                    reason = failure_reason(exc)
+                    log.warning(
+                        "judge_metric_failed", judge=judge, metric=metric, reason=reason, error=str(exc)[:200]
+                    )
                     o.fail(exc, level="WARNING")
-                    return None
+                    return reason
 
     async def score(
         self,
@@ -186,7 +212,8 @@ class Jury:
         reference: str,
         grounding: list[str] | None = None,
     ) -> dict[str, dict[str, Any]]:
-        """{metric: {"score": mean, "judges": {judge: value}, "spread": max-min}} for applicable metrics."""
+        """{metric: {"score": mean, "judges": {judge: value}, "spread": max-min}} for applicable metrics,
+        plus "failed": {judge: reason} when a judge errored (e.g. "max_tokens")."""
         jobs: list[tuple[str, str, Any]] = []
         for metric in self.metrics:
             kwargs = self._inputs(metric, question, answer, contexts, reference, grounding or [])
@@ -198,7 +225,9 @@ class Jury:
         out: dict[str, dict[str, Any]] = {}
         for (metric, judge, _), value in zip(jobs, values, strict=True):
             entry = out.setdefault(metric, {"judges": {}})
-            if value is not None:
+            if isinstance(value, str):
+                entry.setdefault("failed", {})[judge] = value
+            elif value is not None:
                 entry["judges"][judge] = round(value, 4)
         for entry in out.values():
             scores = list(entry["judges"].values())
