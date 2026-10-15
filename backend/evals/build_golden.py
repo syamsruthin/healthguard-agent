@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -165,11 +166,68 @@ async def plan_cases() -> list[Case]:
     return cases
 
 
+async def _network(member_id: str) -> str:
+    row = await _one(
+        "SELECT pl.network_name FROM insurance.members m JOIN insurance.plans pl USING (plan_id) "
+        "WHERE m.member_id = :m",
+        m=member_id,
+    )
+    return str(row["network_name"])
+
+
 # ── Providers (pandas over the CSV lake) ────────────────────────────────
-def provider_cases() -> list[Case]:
-    df = pd.read_csv(settings.lake_dir / "providers.csv", dtype={"zip_code": str, "npi": str})
-    for col in ("is_pcp", "accepting_new_patients", "telehealth_available"):
+def _lake(name: str, flags: tuple[str, ...]) -> pd.DataFrame:
+    df = pd.read_csv(settings.lake_dir / name, dtype={"zip_code": str, "npi": str})
+    for col in flags:
         df[col] = df[col].astype(str).str.lower().eq("true")
+    df["networks"] = df["networks"].fillna("")
+    return df
+
+
+def load_providers() -> pd.DataFrame:
+    return _lake("providers.csv", ("is_pcp", "accepting_new_patients", "telehealth_available"))
+
+
+def load_facilities() -> pd.DataFrame:
+    return _lake("facilities.csv", ("has_emergency_room", "open_24_hours", "accepts_walk_ins"))
+
+
+def in_network(
+    df: pd.DataFrame,
+    *,
+    network: str,
+    city: str,
+    state: str,
+    exclude_npi: str | None = None,
+    **equals: Any,
+) -> pd.DataFrame:
+    """Rows of a lake table in `network` and `city`, matching every `column=value` filter."""
+    mask = df["networks"].str.contains(network, regex=False) & (df["city"] == city) & (df["state"] == state)
+    for col, value in equals.items():
+        mask &= df[col] == value
+    if exclude_npi:
+        mask &= df["npi"] != exclude_npi
+    return df[mask]
+
+
+def names(rows: pd.DataFrame) -> str:
+    return ", ".join(rows["provider_name"]) or "none"
+
+
+def name_res(rows: pd.DataFrame) -> list[str]:
+    """One must_include regex per provider (last name): small result sets are checked by who, not how many."""
+    return [rf"\b{re.escape(n)}\b" for n in rows["last_name"]]
+
+
+def provider_row(df: pd.DataFrame, npi: str) -> dict[str, Any]:
+    rows = df[df["npi"] == npi]
+    if rows.empty:
+        raise RuntimeError(f"NPI {npi} is not in the provider lake (is the lake generated?)")
+    return rows.iloc[0].to_dict()
+
+
+def provider_cases() -> list[Case]:
+    df = load_providers()
     gen = persona("aisha").email
     specs = [
         ("Cardiology", "Austin", "TX", "accepting new patients", df["accepting_new_patients"]),
@@ -422,14 +480,289 @@ async def multi_hop_cases() -> list[Case]:
     ]
 
 
+# ── Multi-intent (provider lake + records and/or policy, independent steps) ──
+async def multi_intent_cases() -> list[Case]:
+    df = load_providers()
+    maria, james, aisha, robert, priya = (persona(k) for k in ("maria", "james", "aisha", "robert", "priya"))
+    nets = {p.key: await _network(p.member_id) for p in (maria, james, aisha, robert, priya)}
+
+    def near(p: Any, specialty: str, **flags: Any) -> pd.DataFrame:
+        return in_network(df, network=nets[p.key], city=p.city, state=p.state, specialty=specialty, **flags)
+
+    pt = near(maria, "Physical Therapy", accepting_new_patients=True)
+    endo = near(james, "Endocrinology", accepting_new_patients=True)
+    psych = near(aisha, "Psychiatry", telehealth_available=True)
+    cardio = near(robert, "Cardiology", accepting_new_patients=True)
+    obgyn = near(priya, "Obstetrics & Gynecology", accepting_new_patients=True)
+    pt_visits = await _one(
+        "SELECT count(DISTINCT service_date) AS n FROM insurance.claims "
+        "WHERE member_id = :m AND provider_specialty = 'Physical Therapy'",
+        m=maria.member_id,
+    )
+    pt_limit = 30  # corpus 16_therapies_dme.md: combined PT/OT rehabilitation visits per plan year
+    oop = await _one(
+        "SELECT oop_individual_met, oop_individual_limit FROM insurance.member_accumulators WHERE member_id = :m",
+        m=robert.member_id,
+    )
+    hsa = await _one("SELECT hsa_balance FROM insurance.members WHERE member_id = :m", m=priya.member_id)
+    return [
+        Case(
+            id="mi-01",
+            category="multi_intent",
+            persona=maria.email,
+            question=(
+                "How many physical therapy visits have I had this year, how many PT visits does my plan cover "
+                f"per year, and which in-network physical therapists in {maria.city} are accepting new patients?"
+            ),
+            reference=(
+                f"You have had {pt_visits['n']} physical therapy visits this year. Your plan covers up to {pt_limit} "
+                f"combined physical and occupational therapy visits per plan year, so {pt_limit - pt_visits['n']} "
+                f"remain. In-network ({nets['maria']}) physical therapists in {maria.city}, {maria.state} accepting "
+                f"new patients: {names(pt)}."
+            ),
+            expected_tools=["sql", "policy_search", "providers"],
+            must_include=[rf"\b{pt_visits['n']}\b", rf"\b{pt_limit}\b", *name_res(pt)],
+            forbidden_ids=forbidden_for(maria.member_id),
+        ),
+        Case(
+            id="mi-02",
+            category="multi_intent",
+            persona=james.email,
+            question=(
+                f"Which endocrinologists in my network in {james.city} are accepting new patients, "
+                "and do I need a referral to see one?"
+            ),
+            reference=(
+                f"In-network ({nets['james']}) endocrinologists in {james.city}, {james.state} accepting new "
+                f"patients: {names(endo)}. Yes, on a {nets['james']} plan specialist visits require an active "
+                "referral from your PCP; specialist claims without a referral are denied with D010."
+            ),
+            expected_tools=["providers", "policy_search"],
+            must_include=[*name_res(endo), r"referral"],
+            forbidden_ids=forbidden_for(james.member_id),
+        ),
+        Case(
+            id="mi-03",
+            category="multi_intent",
+            persona=aisha.email,
+            question=(
+                f"Which in-network psychiatrists in {aisha.city} offer telehealth, "
+                "and do I need a referral to see a therapist?"
+            ),
+            reference=(
+                f"In-network ({nets['aisha']}) psychiatrists in {aisha.city}, {aisha.state} offering telehealth: "
+                f"{names(psych)}. No referral is needed for behavioral health: even on a {nets['aisha']} plan you "
+                "can self-refer to an in-network behavioral health provider."
+            ),
+            expected_tools=["providers", "policy_search"],
+            must_include=[
+                *name_res(psych),
+                r"no referral|not need a referral|don't need a referral|do not need a referral|self-refer",
+            ],
+            forbidden_ids=forbidden_for(aisha.member_id),
+        ),
+        Case(
+            id="mi-04",
+            category="multi_intent",
+            persona=robert.email,
+            question=(
+                f"I need a cardiology follow-up. Which in-network cardiologists in {robert.city} are accepting new "
+                "patients, have I reached my out-of-pocket maximum, and what would a covered in-network visit "
+                "cost me now?"
+            ),
+            reference=(
+                f"In-network ({nets['robert']}) cardiologists in {robert.city}, {robert.state} accepting new "
+                f"patients: {names(cardio)}. You have met ${oop['oop_individual_met']:,.2f} of your "
+                f"${oop['oop_individual_limit']:,.2f} individual out-of-pocket maximum, so covered in-network care "
+                "costs you $0 for the rest of the plan year."
+            ),
+            expected_tools=["providers", "sql", "policy_search"],
+            must_include=[
+                *name_res(cardio),
+                money_re(float(oop["oop_individual_limit"])),
+                r"\$0|nothing|100%",
+            ],
+            forbidden_ids=forbidden_for(robert.member_id),
+        ),
+        Case(
+            id="mi-05",
+            category="multi_intent",
+            persona=priya.email,
+            question=(
+                f"Which in-network OB-GYNs in {priya.city} are accepting new patients, what is my HSA balance, "
+                "and can I use my HSA to pay for my delivery?"
+            ),
+            reference=(
+                f"In-network ({nets['priya']}) OB-GYNs in {priya.city}, {priya.state} accepting new patients: "
+                f"{names(obgyn)}. Your HSA balance is ${hsa['hsa_balance']:,.2f}. Yes: delivery costs are qualified "
+                "medical expenses, so you can pay your share with HSA funds tax-free."
+            ),
+            expected_tools=["providers", "sql", "policy_search"],
+            must_include=[*name_res(obgyn), money_re(float(hsa["hsa_balance"])), r"tax[- ]free|qualified"],
+            forbidden_ids=forbidden_for(priya.member_id),
+        ),
+    ]
+
+
+# ── Dependent hops (a later step needs an earlier step's output: depends_on) ──
+async def dependent_hop_cases() -> list[Case]:
+    providers, facilities = load_providers(), load_facilities()
+    maria, james, robert, david = (persona(k) for k in ("maria", "james", "robert", "david"))
+    nets = {p.key: await _network(p.member_id) for p in (maria, james, david)}
+
+    biopsy = await _one(
+        "SELECT provider_npi, denial_code FROM insurance.claims WHERE member_id = :m AND status = 'denied' "
+        "AND provider_specialty = 'Dermatology'",
+        m=james.member_id,
+    )
+    derm = provider_row(providers, biopsy["provider_npi"])
+    pcps = in_network(
+        providers,
+        network=nets["james"],
+        city=derm["city"],
+        state=derm["state"],
+        specialty="Family Medicine",
+        accepting_new_patients=True,
+    )
+
+    ortho = await _one(
+        "SELECT provider_npi FROM insurance.claims WHERE member_id = :m AND provider_specialty = 'Orthopedic Surgery' "
+        "ORDER BY service_date DESC LIMIT 1",
+        m=maria.member_id,
+    )
+    surgeon = provider_row(providers, ortho["provider_npi"])
+    others = in_network(
+        providers,
+        network=nets["maria"],
+        city=surgeon["city"],
+        state=surgeon["state"],
+        specialty=surgeon["specialty"],
+        accepting_new_patients=True,
+        exclude_npi=surgeon["npi"],
+    )
+
+    uc = await _one(
+        "SELECT provider_npi FROM insurance.claims WHERE subscriber_id = :m AND denial_code = 'D009'",
+        m=david.member_id,
+    )
+    clinic = provider_row(facilities, uc["provider_npi"])
+    centers = in_network(
+        facilities,
+        network=nets["david"],
+        city=clinic["city"],
+        state=clinic["state"],
+        facility_type="Urgent Care",
+    )
+    n_uc = len(centers)
+
+    dup = await _one(
+        "SELECT provider_npi FROM insurance.claims WHERE member_id = :m AND denial_code = 'D004'",
+        m=robert.member_id,
+    )
+    cardio = provider_row(providers, dup["provider_npi"])
+    return [
+        Case(
+            id="dep-01",
+            category="dependent_hop",
+            persona=james.email,
+            question=(
+                "My skin biopsy claim was denied. Why, and which in-network family medicine doctors in the same "
+                "city as the doctor on that claim are accepting new patients, so I can sort it out?"
+            ),
+            reference=(
+                f"The biopsy by {derm['provider_name']} ({derm['city']}, {derm['state']}) was denied with "
+                f"{biopsy['denial_code']} because {nets['james']} specialist visits need a referral from your PCP. "
+                f"In-network ({nets['james']}) family medicine doctors in {derm['city']} accepting new patients: "
+                f"{names(pcps)}."
+            ),
+            expected_tools=["sql", "providers"],
+            must_include=[r"referral", *name_res(pcps)],
+            forbidden_ids=forbidden_for(james.member_id),
+        ),
+        Case(
+            id="dep-02",
+            category="dependent_hop",
+            persona=maria.email,
+            question=(
+                "Who is the orthopedic surgeon I've been seeing for my knee, and which other in-network "
+                "orthopedic surgeons in the same city are accepting new patients?"
+            ),
+            reference=(
+                f"You have been seeing {surgeon['provider_name']} at {surgeon['practice_name']} in "
+                f"{surgeon['city']}, {surgeon['state']}. Other in-network ({nets['maria']}) orthopedic surgeons in "
+                f"{surgeon['city']} accepting new patients: {names(others)}."
+            ),
+            expected_tools=["sql", "providers"],
+            must_include=[rf"\b{surgeon['last_name']}\b", *name_res(others)],
+            forbidden_ids=forbidden_for(maria.member_id),
+        ),
+        Case(
+            id="dep-03",
+            category="dependent_hop",
+            persona=david.email,
+            question=(
+                "Our urgent care claim was denied as out of network. How many in-network urgent care centers are "
+                "there in the same city as the clinic on that claim?"
+            ),
+            reference=(
+                f"The denied claim was from {clinic['name']} in {clinic['city']}, {clinic['state']}, which is not "
+                f"in the {nets['david']} network. There {'is' if n_uc == 1 else 'are'} {n_uc} in-network "
+                f"({nets['david']}) urgent care center{'' if n_uc == 1 else 's'} in {clinic['city']}: "
+                f"{', '.join(centers['name'])}."
+            ),
+            expected_tools=["sql", "providers"],
+            must_include=[rf"\b{n_uc}\b"],
+            forbidden_ids=forbidden_for(david.member_id),
+        ),
+        Case(
+            id="dep-04",
+            category="dependent_hop",
+            persona=robert.email,
+            question=(
+                "Which practice is the cardiologist on my denied September claim with, and how many days until "
+                "their next available appointment?"
+            ),
+            reference=(
+                f"The denied September claim (duplicate, D004) was from {cardio['provider_name']} at "
+                f"{cardio['practice_name']}; their next available appointment is in "
+                f"{cardio['next_available_days']} days."
+            ),
+            expected_tools=["sql", "providers"],
+            must_include=[cardio["practice_name"].split()[0], rf"\b{cardio['next_available_days']}\b"],
+            forbidden_ids=forbidden_for(robert.member_id),
+        ),
+    ]
+
+
 # ── Follow-ups that rely on conversation memory ────────────────────────
 async def memory_cases() -> list[Case]:
-    maria, robert = persona("maria"), persona("robert")
+    maria, robert, james, david, priya = (persona(k) for k in ("maria", "robert", "james", "david", "priya"))
     acc = await _one(
         "SELECT deductible_individual_limit - deductible_individual_met AS left FROM insurance.member_accumulators "
         "WHERE member_id = :m",
         m=maria.member_id,
     )
+    providers = load_providers()
+    biopsy = await _one(
+        "SELECT provider_npi FROM insurance.claims WHERE member_id = :m AND status = 'denied' "
+        "AND provider_specialty = 'Dermatology'",
+        m=james.member_id,
+    )
+    derm = provider_row(providers, biopsy["provider_npi"])
+    peds = in_network(
+        providers,
+        network=await _network(david.member_id),
+        city=david.city,
+        state=david.state,
+        specialty="Pediatrics",
+    )
+    tele = peds[peds["telehealth_available"]]
+    hsa = await _one(
+        "SELECT m.hsa_balance, a.deductible_individual_limit - a.deductible_individual_met AS left "
+        "FROM insurance.members m JOIN insurance.member_accumulators a USING (member_id) WHERE member_id = :m",
+        m=priya.member_id,
+    )
+    enough = hsa["hsa_balance"] >= hsa["left"]
     return [
         Case(
             id="memory-01",
@@ -452,6 +785,52 @@ async def memory_cases() -> list[Case]:
             expected_tools=[],
             must_include=[r"\$0|nothing|100%"],
             forbidden_ids=forbidden_for(robert.member_id),
+        ),
+        Case(
+            id="memory-03",
+            category="memory_followup",
+            persona=james.email,
+            prior_turns=["Who was the doctor on my denied skin biopsy claim?"],
+            question="Is that doctor accepting new patients, and which practice are they with?",
+            reference=(
+                f"{derm['provider_name']} is {'' if derm['accepting_new_patients'] else 'not '}accepting new patients "
+                f"and practices at {derm['practice_name']} in {derm['city']}, {derm['state']}."
+            ),
+            expected_tools=["providers"],
+            must_include=[derm["practice_name"].split()[0]],  # accepting yes/no is left to the judges
+            forbidden_ids=forbidden_for(james.member_id),
+        ),
+        Case(
+            id="memory-04",
+            category="memory_followup",
+            persona=david.email,
+            prior_turns=[f"How many in-network pediatricians are there in {david.city}?"],
+            question="Which of them offer telehealth?",
+            reference=(
+                f"Of the {len(peds)} in-network pediatricians in {david.city}, {david.state} ({names(peds)}), "
+                f"these offer telehealth: {names(tele)}."
+            ),
+            expected_tools=["providers"],
+            must_include=name_res(tele),
+            forbidden_ids=forbidden_for(david.member_id),
+        ),
+        Case(
+            id="memory-05",
+            category="memory_followup",
+            persona=priya.email,
+            prior_turns=["What is my HSA balance?"],
+            question="Is it enough to cover the rest of my deductible?",
+            reference=(
+                f"Your HSA balance is ${hsa['hsa_balance']:,.2f} and you have ${hsa['left']:,.2f} of your individual "
+                + (
+                    "deductible left, so yes, it covers the rest of your deductible."
+                    if enough
+                    else f"deductible left, so no: it falls ${hsa['left'] - hsa['hsa_balance']:,.2f} short."
+                )
+            ),
+            expected_tools=["sql"],
+            must_include=[money_re(float(hsa["left"]))],
+            forbidden_ids=forbidden_for(priya.member_id),
         ),
     ]
 
@@ -570,6 +949,8 @@ async def build() -> list[Case]:
         *policy_cases(),
         *await member_cases(),
         *await multi_hop_cases(),
+        *await multi_intent_cases(),
+        *await dependent_hop_cases(),
         *await memory_cases(),
         *refusal_cases(),
         *await admin_cases(),
