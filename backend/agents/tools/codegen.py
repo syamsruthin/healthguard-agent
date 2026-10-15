@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from backend.agents.tools.base import ToolResult
+from backend.core import observability as obs
 from backend.core.config import settings
 from backend.core.logging import get_logger
 from backend.core.telemetry import TOOL_EVENTS
@@ -50,36 +51,46 @@ async def run_codegen(tool: CodegenTool, *, step_id: str, task: str) -> ToolResu
     for attempt in range(settings.max_tool_retries + 1):
         attempts = attempt + 1
         gen = None
-        try:
-            gen = await llm.complete(
-                Role.CODE,
-                tool.build_messages(error),
-                name=tool.name if attempt == 0 else f"{tool.name}.retry{attempt}",
-                use_cache=attempt == 0,
-            )
-            code = strip_fences(gen.text)
-            result = await tool.execute(code)
-            TOOL_EVENTS.labels(tool=tool.name, outcome="ok" if attempt == 0 else "ok_after_retry").inc()
-            return ToolResult(
-                step_id=step_id,
-                tool=tool.name,
-                task=task,
-                ok=True,
-                code=code,
-                data=result.data,
-                row_count=result.row_count,
-                truncated=result.truncated,
-                formatted=result.formatted,
-                attempts=attempts,
-                duration_ms=int((time.monotonic() - t0) * 1000),
-            )
-        except LLMError as exc:
-            error, error_code = str(exc), "llm_unavailable"
-            TOOL_EVENTS.labels(tool=tool.name, outcome="llm_unavailable").inc()
-            break
-        except Exception as exc:  # guard / sandbox / database rejections are fed back to the model
-            error, error_code, outcome = tool.describe_failure(exc, code)
-            TOOL_EVENTS.labels(tool=tool.name, outcome=outcome).inc()
+        # One span per attempt (generation → validation / execution); the error feeds the next attempt.
+        with obs.observe(
+            f"attempt {attempts}",
+            input={"previous_error": error} if error else None,
+            metadata={"tool": tool.name},
+        ) as attempt_obs:
+            try:
+                gen = await llm.complete(
+                    Role.CODE,
+                    tool.build_messages(error),
+                    name=tool.name if attempt == 0 else f"{tool.name}.retry{attempt}",
+                    use_cache=attempt == 0,
+                )
+                code = strip_fences(gen.text)
+                result = await tool.execute(code)
+                TOOL_EVENTS.labels(tool=tool.name, outcome="ok" if attempt == 0 else "ok_after_retry").inc()
+                attempt_obs.update(output={"ok": True, "rows": result.row_count}, metadata={"code": code})
+                return ToolResult(
+                    step_id=step_id,
+                    tool=tool.name,
+                    task=task,
+                    ok=True,
+                    code=code,
+                    data=result.data,
+                    row_count=result.row_count,
+                    truncated=result.truncated,
+                    formatted=result.formatted,
+                    attempts=attempts,
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                )
+            except LLMError as exc:
+                error, error_code = str(exc), "llm_unavailable"
+                TOOL_EVENTS.labels(tool=tool.name, outcome="llm_unavailable").inc()
+                attempt_obs.fail(exc)
+                break
+            except Exception as exc:  # guard / sandbox / database rejections are fed back to the model
+                error, error_code, outcome = tool.describe_failure(exc, code)
+                TOOL_EVENTS.labels(tool=tool.name, outcome=outcome).inc()
+                attempt_obs.update(output={"ok": False, "error_code": error_code}, metadata={"code": code})
+                attempt_obs.fail(f"{outcome}: {str(exc)[:300]}", level="WARNING")
         if gen is not None:
             await llm_cache.forget(gen.cache_key)  # a rejected first attempt must not be replayed
         log.info("tool_retry", tool=tool.name, step=step_id, attempt=attempts, error=error[:200])

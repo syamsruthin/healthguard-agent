@@ -21,6 +21,7 @@ from typing import Any
 from pydantic import BaseModel
 from sqlalchemy import text
 
+from backend.core import observability as obs
 from backend.core.config import settings
 from backend.core.logging import get_logger
 from backend.db.session import SessionLocal
@@ -139,6 +140,20 @@ async def _llm_rerank(query: str, hits: list[RetrievedChunk], top_n: int) -> lis
         return hits[:top_n]
 
 
+def _ranked(hits: list[RetrievedChunk]) -> list[dict[str, Any]]:
+    """Compact view of a ranked list for tracing."""
+    return [
+        {
+            "chunk_id": h.chunk_id,
+            "section": h.section_path,
+            "vector": None if h.vector_score is None else round(h.vector_score, 4),
+            "keyword": None if h.keyword_score is None else round(h.keyword_score, 4),
+            "rrf": h.rrf_score or None,
+        }
+        for h in hits
+    ]
+
+
 async def hybrid_search(
     query: str,
     *,
@@ -148,17 +163,36 @@ async def hybrid_search(
 ) -> list[RetrievedChunk]:
     top_k = top_k or settings.rag_top_k
     cand = settings.rag_candidate_k
-    embedding = await embed_query(query)
     # SBCs: only the member's own plan, plus any plan explicitly named in the query.
     named = sorted({m.group(0).upper() for m in _PLAN_ID.finditer(query)})
     params = {"plan_id": plan_id, "named_plans": named, "categories": categories, "k": cand}
-    async with SessionLocal() as session:
-        vec_rows = (await session.execute(_VECTOR_SQL, {**params, "embedding": str(embedding)})).all()
-        kw_rows = (await session.execute(_KEYWORD_SQL, {**params, "query": query})).all()
-    vector_hits = [_row_to_chunk(r, "vector") for r in vec_rows]
-    keyword_hits = [_row_to_chunk(r, "keyword") for r in kw_rows]
-    pool = top_k * 2 if settings.rag_rerank else top_k
-    fused = reciprocal_rank_fusion([vector_hits, keyword_hits], top_n=pool)
-    if settings.rag_rerank and len(fused) > top_k:
-        fused = await _llm_rerank(query, fused, top_k)
-    return fused
+    with obs.observe(
+        "hybrid_search",
+        as_type="retriever",
+        input=query,
+        metadata={
+            "plan_id": plan_id,
+            "named_plans": named,
+            "categories": categories,
+            "top_k": top_k,
+            "candidate_k": cand,
+            "rerank": settings.rag_rerank,
+        },
+    ) as o:
+        embedding = await embed_query(query)
+        async with SessionLocal() as session:
+            with obs.observe("vector_search", as_type="retriever", metadata={"k": cand}) as v:
+                vec_rows = (await session.execute(_VECTOR_SQL, {**params, "embedding": str(embedding)})).all()
+                vector_hits = [_row_to_chunk(r, "vector") for r in vec_rows]
+                v.update(output=_ranked(vector_hits[:10]), metadata={"hits": len(vector_hits)})
+            with obs.observe("keyword_search", as_type="retriever", input=query, metadata={"k": cand}) as k:
+                kw_rows = (await session.execute(_KEYWORD_SQL, {**params, "query": query})).all()
+                keyword_hits = [_row_to_chunk(r, "keyword") for r in kw_rows]
+                k.update(output=_ranked(keyword_hits[:10]), metadata={"hits": len(keyword_hits)})
+        pool = top_k * 2 if settings.rag_rerank else top_k
+        fused = reciprocal_rank_fusion([vector_hits, keyword_hits], top_n=pool)
+        obs.event("rrf_fusion", output=_ranked(fused), pool=pool)
+        if settings.rag_rerank and len(fused) > top_k:
+            fused = await _llm_rerank(query, fused, top_k)
+        o.update(output=_ranked(fused), metadata={"returned": len(fused)})
+        return fused

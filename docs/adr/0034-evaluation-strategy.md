@@ -9,7 +9,7 @@
 
 ## Decision
 
-**Golden set** ([evals/build_golden.py](../../backend/evals/build_golden.py)): `hg-build-golden` builds **59 cases in 10 categories** from the seeded database with **no LLM calls**. Numeric references come from SQL and pandas over the same data the tools see; policy references quote the corpus. Each case has a persona, optional prior turns, `expected_tools`, `expected_outcome`, `must_include` regexes and `forbidden_ids`.
+**Golden set** ([evals/build_golden.py](../../backend/evals/build_golden.py)): `hg-build-golden` builds **71 cases in 12 categories** from the seeded database with **no LLM calls**. Numeric references come from SQL and pandas over the same data the tools see; policy references quote the corpus. Each case has a persona, optional prior turns, `expected_tools`, `expected_outcome`, `must_include` regexes and `forbidden_ids`.
 
 | Category | Cases |
 |---|---|

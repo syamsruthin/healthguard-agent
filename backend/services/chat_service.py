@@ -11,6 +11,9 @@ disconnect never cancels persistence):
   (events forwarded live, bounded by TURN_TIMEOUT_SECONDS) → persist assistant
   message, trace and LLM calls →
   final event → semantic-cache store → follow-up jobs.
+
+The whole stream phase is one Langfuse trace (`chat-turn`, id = the turn's
+`trace_id`, session = the conversation), scored with the turn's outcome.
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ from backend.agents.runner import run_graph
 from backend.agents.state import initial_state
 from backend.agents.tools.base import UserContext
 from backend.cache.semantic import maybe_store
+from backend.core import observability as obs
 from backend.core.config import settings
 from backend.core.errors import AppError, ConflictError
 from backend.core.logging import get_logger
@@ -44,6 +48,7 @@ from backend.core.telemetry import TURN_LATENCY
 from backend.db.base import utcnow
 from backend.db.models import Conversation, Message, Trace, User
 from backend.db.session import SessionLocal, get_data_version
+from backend.llm.prompts import PROMPT_VERSION
 from backend.llm.usage import UsageCollector, start_collection, stop_collection
 from backend.memory import long_term
 from backend.memory.context import MemoryContext, build_context
@@ -67,6 +72,7 @@ class PreparedTurn:
     first_turn: bool
     lock_key: str
     started: float
+    role: str = "member"
 
 
 async def _noop(_: dict[str, Any]) -> None:
@@ -111,6 +117,7 @@ async def prepare_turn(
         first_turn=first_turn,
         lock_key=lock_key,
         started=time.monotonic(),
+        role=user.role,
     )
 
 
@@ -243,10 +250,13 @@ async def _enqueue_followups(
     """Background work, each job only when it can do something (they cost model calls)."""
     q = get_enqueuer()
     cid = str(prepared.conversation_id)
+    queued: list[str] = []
     if prepared.first_turn:
         await q.enqueue("title_conversation", cid, job_id=f"title:{cid}")
+        queued.append("title_conversation")
     if memory.needs_summary_after(prepared.message, final.get("answer", "")):
         await q.enqueue("summarize_conversation", cid, job_id=f"summarize:{cid}:{assistant_id}")
+        queued.append("summarize_conversation")
     outcome = final.get("outcome")
     if (
         user.memory_enabled
@@ -260,12 +270,81 @@ async def _enqueue_followups(
             str(assistant_id),
             job_id=f"memory:{assistant_id}",
         )
+        queued.append("extract_memories")
     if outcome == "answered" and random.random() < settings.online_eval_sample_rate:
         await q.enqueue("online_eval", str(assistant_id), "sample", job_id=f"oe:{assistant_id}")
+        queued.append("online_eval")
+    obs.event("followups.enqueued", output=queued)
+
+
+def _score_turn(trace_id: str, final: dict[str, Any], payload: dict[str, Any]) -> None:
+    """Turn-level Langfuse scores: filterable outcome, cache and verifier signals."""
+    obs.score(trace_id, "outcome", payload["outcome"], data_type="CATEGORICAL")
+    if payload.get("fallback"):
+        obs.score(trace_id, "fallback", payload["fallback"], data_type="CATEGORICAL")
+    obs.score(trace_id, "cache_hit", bool(payload.get("cache_hit")))
+    verification = final.get("verification") or {}
+    if verification and not verification.get("skipped"):
+        for key in ("grounded", "complete"):
+            if key in verification:
+                obs.score(trace_id, key, bool(verification[key]), comment=verification.get("reason") or None)
+    obs.score(trace_id, "replans", float(final.get("replans", 0)), data_type="NUMERIC")
+    obs.score(trace_id, "revisions", float(final.get("revisions", 0)), data_type="NUMERIC")
 
 
 async def execute_turn(prepared: PreparedTurn, sink: EventSink = _noop) -> dict[str, Any]:
     trace_id = uuid.uuid4()
+    lf_trace_id = obs.trace_id_for(trace_id)
+    with (
+        obs.propagate(
+            user_id=str(prepared.user_id),
+            session_id=str(prepared.conversation_id),
+            trace_name="chat-turn",
+            tags=["chat", prepared.role, settings.env],
+            version=f"{settings.app_version}+prompts.{PROMPT_VERSION}",
+            metadata={"turn_id": prepared.turn_id, "first_turn": prepared.first_turn},
+        ),
+        obs.observe(
+            "chat-turn",
+            as_type="agent",
+            trace_id=lf_trace_id,
+            input={"message": prepared.message},
+            metadata={
+                "turn_id": prepared.turn_id,
+                "user_message_id": str(prepared.user_message_id),
+                "first_turn": prepared.first_turn,
+                "models": {
+                    "fast": settings.model_fast,
+                    "code": settings.model_code,
+                    "synth": settings.model_synth,
+                },
+            },
+        ) as root,
+    ):
+        final, payload = await _execute_turn(prepared, sink, trace_id)
+        root.update(
+            output=payload["answer"],
+            metadata={
+                "outcome": payload["outcome"],
+                "fallback": payload["fallback"],
+                "cache_hit": payload["cache_hit"],
+                "standalone_query": payload["standalone_query"],
+                "latency_ms": payload["latency_ms"],
+                "usage": payload["usage"],
+                "message_id": payload["message_id"],
+                "plan": [f"{s['id']}:{s['tool']}" for s in payload["plan"]],
+                "citations": [c.get("tag") for c in final.get("citations", [])],
+            },
+        )
+        if payload["outcome"] == "error":
+            root.fail(f"fallback: {payload['fallback']}")
+        _score_turn(lf_trace_id, final, payload)
+    return payload
+
+
+async def _execute_turn(
+    prepared: PreparedTurn, sink: EventSink, trace_id: uuid.UUID
+) -> tuple[dict[str, Any], dict[str, Any]]:
     structlog.contextvars.bind_contextvars(
         conversation_id=str(prepared.conversation_id), trace_id=str(trace_id), user_id=str(prepared.user_id)
     )
@@ -284,18 +363,33 @@ async def execute_turn(prepared: PreparedTurn, sink: EventSink = _noop) -> dict[
     memory = MemoryContext()
     state: dict[str, Any] = {}
     try:
-        async with SessionLocal() as session:
-            user = await session.get(User, prepared.user_id)
-            conversation = await session.get(Conversation, prepared.conversation_id)
-            if user is None or conversation is None:
-                raise AppError("Conversation no longer exists", code="conversation_gone")
-            ctx = await load_user_context(session, user)
-            memory = await build_context(
-                session,
-                conversation=conversation,
-                user=user,
-                message=prepared.message,
-                exclude_message_id=prepared.user_message_id,
+        with obs.observe("load-context") as ctx_obs:
+            async with SessionLocal() as session:
+                user = await session.get(User, prepared.user_id)
+                conversation = await session.get(Conversation, prepared.conversation_id)
+                if user is None or conversation is None:
+                    raise AppError("Conversation no longer exists", code="conversation_gone")
+                ctx = await load_user_context(session, user)
+                memory = await build_context(
+                    session,
+                    conversation=conversation,
+                    user=user,
+                    message=prepared.message,
+                    exclude_message_id=prepared.user_message_id,
+                )
+            ctx_obs.update(
+                output={
+                    "profile": ctx.profile_text(),
+                    "recent_turns": memory.recent_turns,
+                    "summary": memory.summary,
+                    "memories": memory.memories,
+                },
+                metadata={
+                    "history_turns": len(memory.lines),
+                    "has_summary": bool(memory.summary),
+                    "memory_enabled": user.memory_enabled,
+                    "has_member_profile": bool(ctx.member_id),
+                },
             )
         if user.role != "admin":
             sink = _member_sink(sink)
@@ -320,6 +414,7 @@ async def execute_turn(prepared: PreparedTurn, sink: EventSink = _noop) -> dict[
             )
     except TimeoutError:
         log.warning("turn_timed_out", timeout_s=settings.turn_timeout_seconds)
+        obs.current().fail(f"turn timed out after {settings.turn_timeout_seconds:.0f}s")
         final = {**state, "outcome": "error", "fallback": "timeout", "answer": FALLBACKS["timeout"]}
         await sink(
             {"type": "error", "code": "turn_timeout", "message": "The turn took too long", "retryable": True}
@@ -327,6 +422,7 @@ async def execute_turn(prepared: PreparedTurn, sink: EventSink = _noop) -> dict[
         await sink({"type": "answer_replaced", "answer": final["answer"], "reason": "timeout"})
     except Exception as exc:
         log.exception("turn_failed")
+        obs.current().fail(exc)
         reason = "llm_unavailable"
         final = {**state, "outcome": "error", "fallback": reason, "answer": FALLBACKS[reason]}
         await sink({"type": "error", "code": "turn_failed", "message": str(exc)[:200], "retryable": True})
@@ -334,7 +430,9 @@ async def execute_turn(prepared: PreparedTurn, sink: EventSink = _noop) -> dict[
         stop_collection(token)
 
     latency_ms = int((time.monotonic() - prepared.started) * 1000)
-    assistant_id = await _persist(prepared, final, collector, trace_id=trace_id, latency_ms=latency_ms)
+    with obs.observe("persist", metadata={"llm_calls": len(collector.calls)}) as persist_obs:
+        assistant_id = await _persist(prepared, final, collector, trace_id=trace_id, latency_ms=latency_ms)
+        persist_obs.update(output={"message_id": str(assistant_id)})
     # Admins get the full trace and generated code; members get the plan, steps and verdict
     # (everything is persisted either way and readable by admins via /admin/traces).
     admin = user is not None and user.role == "admin"
@@ -356,18 +454,21 @@ async def execute_turn(prepared: PreparedTurn, sink: EventSink = _noop) -> dict[
         "usage": collector.totals,
         "trace_id": str(trace_id),
         "trace": final.get("trace", []) if admin else [],
+        "langfuse_url": await asyncio.to_thread(obs.trace_url, trace_id) if admin and obs.enabled() else None,
     }
     await sink({"type": "final", **payload})
     TURN_LATENCY.observe(latency_ms / 1000)
 
     if ctx is not None and user is not None:
         try:
-            await maybe_store(final, ctx, source_message_id=str(assistant_id))
+            with obs.observe("semantic_cache.store", input=final.get("cache_query") or None) as store_obs:
+                scope = await maybe_store(final, ctx, source_message_id=str(assistant_id))
+                store_obs.update(output={"stored": scope is not None, "scope": scope})
             await _enqueue_followups(prepared, final, user, assistant_id, memory)
         except Exception as exc:  # follow-ups never fail the turn
             log.warning("turn_followups_failed", error=str(exc)[:200])
     structlog.contextvars.unbind_contextvars("conversation_id", "trace_id")
-    return payload
+    return final, payload
 
 
 async def run_turn(prepared: PreparedTurn, sink: EventSink = _noop) -> dict[str, Any]:

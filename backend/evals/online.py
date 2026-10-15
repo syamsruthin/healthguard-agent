@@ -1,7 +1,9 @@
 """
 Online evaluation: a jury of judges from different model families scores a
 live answer for faithfulness and relevancy. Runs in the worker for a sample
-of turns (ONLINE_EVAL_SAMPLE_RATE) and for every thumbs-down.
+of turns (ONLINE_EVAL_SAMPLE_RATE) and for every thumbs-down. The jury's
+scores are also attached to the judged turn's Langfuse trace
+(`online_faithfulness`, `online_relevancy`, per-judge values in metadata).
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from sqlalchemy import exists, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.agents.trace import synthesis_sources
+from backend.core import observability as obs
 from backend.core.config import settings
 from backend.core.logging import get_logger
 from backend.db.models import Message, OnlineEvalScore, Trace
@@ -49,11 +52,17 @@ async def _turn_inputs(session: AsyncSession, message: Message) -> tuple[str, st
 
 
 async def _judge(model: str, messages: list[dict[str, Any]]) -> JudgeScores | None:
-    try:
-        return await get_llm().structured(Role.JUDGE, messages, JudgeScores, name="online_eval", model=model)
-    except Exception as exc:  # one failing judge must not sink the jury
-        log.warning("judge_failed", judge=model, error=str(exc)[:200])
-        return None
+    with obs.observe(f"judge · {model}", as_type="evaluator", metadata={"judge": model}) as o:
+        try:
+            verdict = await get_llm().structured(
+                Role.JUDGE, messages, JudgeScores, name="online_eval", model=model
+            )
+        except Exception as exc:  # one failing judge must not sink the jury
+            log.warning("judge_failed", judge=model, error=str(exc)[:200])
+            o.fail(exc, level="WARNING")
+            return None
+        o.update(output=verdict.model_dump())
+        return verdict
 
 
 async def score_message(session: AsyncSession, message_id: uuid.UUID) -> dict[str, float] | None:
@@ -64,6 +73,11 @@ async def score_message(session: AsyncSession, message_id: uuid.UUID) -> dict[st
     if already.scalar():  # a sampled answer later thumbed down (or re-rated) is not judged again
         return None
     question, sources = await _turn_inputs(session, message)
+    turn_trace = obs.trace_id_for(message.trace_id) if message.trace_id else None
+    obs.current().update(
+        input={"question": question, "answer": message.content},
+        metadata={"turn_trace_id": turn_trace, "message_id": str(message_id)},
+    )
     messages = build_judge_messages(question=question, sources=sources, answer=message.content)
     judges = settings.online_eval_judges
     verdicts = await asyncio.gather(*(_judge(j, messages) for j in judges))
@@ -75,6 +89,13 @@ async def score_message(session: AsyncSession, message_id: uuid.UUID) -> dict[st
         per_judge = {j: float(getattr(v, metric)) for j, v in scored.items()}
         values = list(per_judge.values())
         result[metric] = round(mean(values), 4)
+        obs.score(
+            turn_trace,
+            f"online_{metric}",
+            result[metric],
+            data_type="NUMERIC",
+            metadata={"judges": per_judge, "spread": round(max(values) - min(values), 4)},
+        )
         session.add(
             OnlineEvalScore(
                 message_id=message.id,

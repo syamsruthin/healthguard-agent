@@ -31,6 +31,7 @@ Related documents: [README](../README.md) (setup, usage, configuration), [archit
 | 13 | Architecture diagrams, LLM tracing spans, Docker stack verified, README | `f99ce81`, `1e2d363` |
 | — | Jev Router as the default for the fast, code and synthesis roles | `4d8604d` |
 | — | Engineering review: reliability, cost, privacy, refactors, docs (§5) | `9a1eb6d`, `f2bc4e2`, `f2c1515`, `651bdbd`, this commit |
+| — | Langfuse LLM observability: one trace per turn / job / eval case, generations with OpenRouter cost, scores, masked I/O ([ADR-0040](adr/0040-langfuse-llm-observability.md)) | branch `feature/langfuse-observability` |
 
 ---
 

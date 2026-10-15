@@ -1,7 +1,8 @@
 """
 arq background tasks. Each runs inside its own usage collection, and its LLM
 calls are persisted to `app.llm_calls` (without a trace id) so background
-cost shows up in the admin dashboards.
+cost shows up in the admin dashboards. Each is also its own Langfuse trace
+(`job:<name>`), in the conversation's session when it has one.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from typing import Any
 
 from sqlalchemy import select
 
+from backend.core import observability as obs
 from backend.core.logging import get_logger
 from backend.core.redis import get_redis
 from backend.db.models import Conversation, Message, User
@@ -38,10 +40,23 @@ async def _persist_calls(collector: UsageCollector) -> None:
         await session.commit()
 
 
-async def _accounted[T](fn: Callable[[], Awaitable[T]]) -> T:
+async def _accounted[T](
+    job: str,
+    fn: Callable[[], Awaitable[T]],
+    *,
+    session_id: str | None = None,
+    user_id: str | None = None,
+    input: Any = None,
+) -> T:
     collector, token = start_collection()
     try:
-        return await fn()
+        with (
+            obs.propagate(trace_name=f"job:{job}", session_id=session_id, user_id=user_id, tags=["job", job]),
+            obs.observe(f"job:{job}", as_type="agent", input=input) as o,
+        ):
+            result = await fn()
+            o.update(output=result, metadata={"usage": collector.totals})
+            return result
     finally:
         stop_collection(token)
         await _persist_calls(collector)
@@ -68,7 +83,7 @@ async def title_conversation(ctx: dict[str, Any], conversation_id: str) -> str |
             await session.commit()
             return conv.title
 
-    return await _accounted(run)
+    return await _accounted("title", run, session_id=conversation_id)
 
 
 async def summarize_conversation(ctx: dict[str, Any], conversation_id: str) -> bool:
@@ -81,7 +96,7 @@ async def summarize_conversation(ctx: dict[str, Any], conversation_id: str) -> b
             async with SessionLocal() as session:
                 return await maybe_summarize(session, uuid.UUID(conversation_id))
 
-        return await _accounted(run)
+        return await _accounted("summarize", run, session_id=conversation_id)
     finally:
         await get_redis().delete(lock)
 
@@ -105,7 +120,9 @@ async def extract_memories(
             )
             return len(stored)
 
-    return await _accounted(run)
+    return await _accounted(
+        "extract_memories", run, user_id=user_id, input={"assistant_message_id": assistant_message_id}
+    )
 
 
 async def run_offline_eval(ctx: dict[str, Any], run_id: str, limit: int | None = None) -> dict[str, Any]:
@@ -125,4 +142,4 @@ async def online_eval(
         log.info("online_eval_scored", message_id=message_id, reason=reason, scores=scores)
         return scores
 
-    return await _accounted(run)
+    return await _accounted("online_eval", run, input={"message_id": message_id, "reason": reason})

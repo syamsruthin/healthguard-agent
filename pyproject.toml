@@ -48,6 +48,7 @@ dependencies = [
     "opentelemetry-instrumentation-fastapi>=0.48b0",
     "opentelemetry-instrumentation-httpx>=0.48b0",
     "opentelemetry-instrumentation-sqlalchemy>=0.48b0",
+    "langfuse>=5.0.1",  # LLM tracing, scores and cost per observation (off unless keys are set)
     # Evaluation
     "ragas>=0.4.0",
     # ragas 0.4.x imports langchain_community.chat_models.vertexai (removed in 0.4.2)

@@ -13,6 +13,7 @@ from tabulate import tabulate
 from backend.agents.tools.base import MEMBER_ID_RE, ToolResult, UserContext, jsonable
 from backend.agents.tools.codegen import CodegenTool, Execution, run_codegen
 from backend.agents.tools.sql_guard import SQLGuardError, validate_sql
+from backend.core import observability as obs
 from backend.core.config import settings
 from backend.db.session import get_agent_pool
 from backend.llm.prompts.sql import build_sql_messages
@@ -56,8 +57,18 @@ def _describe_failure(exc: Exception, sql: str) -> tuple[str, str, str]:
 
 async def run_sql_tool(step_id: str, task: str, user: UserContext, prior: str = "") -> ToolResult:
     async def execute(sql: str) -> Execution:
-        rows, truncated = await execute_scoped(validate_sql(sql, max_rows=settings.sql_max_rows), user)
-        return Execution(rows, format_rows(rows, len(rows), truncated), len(rows), truncated)
+        with obs.observe("sql.guard", as_type="guardrail", input=sql) as g:
+            safe = validate_sql(sql, max_rows=settings.sql_max_rows)
+            g.update(output=safe, metadata={"rewritten": safe != sql})
+        with obs.observe(
+            "sql.execute",
+            input=safe,
+            metadata={"rls_role": "admin" if user.is_admin else "member", "max_rows": settings.sql_max_rows},
+        ) as x:
+            rows, truncated = await execute_scoped(safe, user)
+            formatted = format_rows(rows, len(rows), truncated)
+            x.update(output=formatted, metadata={"rows": len(rows), "truncated": truncated})
+        return Execution(rows, formatted, len(rows), truncated)
 
     tool = CodegenTool(
         name="sql",

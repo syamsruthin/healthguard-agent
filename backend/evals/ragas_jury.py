@@ -5,12 +5,16 @@ Every metric is scored once per judge (EVAL_JUDGES, via OpenRouter); the case
 score is the mean over the judges that succeeded, and the spread (max − min)
 flags disagreement. Judge responses are cached on disk, so re-running
 unchanged cases costs nothing. RAGAS calls OpenRouter with its own client, so
-a response hook (`SpendMeter`) adds up the cost OpenRouter reports per call.
+a response hook (`SpendMeter`) adds up the cost OpenRouter reports per call
+and records each judge call as a Langfuse generation under its metric.
+(`langfuse.openai` is not used: it patches the OpenAI SDK process-wide and
+would double-trace the agent's own calls.)
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from pathlib import Path
 from statistics import mean
@@ -28,6 +32,7 @@ from ragas.metrics.collections import (
     Faithfulness,
 )
 
+from backend.core import observability as obs
 from backend.core.config import settings
 from backend.core.logging import get_logger
 
@@ -58,11 +63,48 @@ class SpendMeter:
             return
         await response.aread()  # httpx keeps the body, so the SDK can still parse it
         try:
-            usage = response.json().get("usage") or {}
+            body = response.json()
         except ValueError:
             return
+        usage = body.get("usage") or {}
         self.calls += 1
         self.cost_usd += float(usage.get("cost") or 0.0)
+        _trace_judge_call(response, body)
+
+
+def _trace_judge_call(response: Any, body: dict[str, Any]) -> None:
+    """A judge call as a generation under the current metric observation (only inside a trace)."""
+    if not obs.current().active:
+        return
+    try:
+        request = json.loads(response.request.content or b"{}")
+    except ValueError:
+        request = {}
+    usage = body.get("usage") or {}
+    choices = body.get("choices") or []
+    gen = obs.start(
+        "llm.judge" if "messages" in request else "embed.judge",
+        as_type="generation" if "messages" in request else "embedding",
+        input=request.get("messages") or request.get("input"),
+        model=body.get("model") or request.get("model"),
+        model_parameters={"max_tokens": request.get("max_tokens"), "temperature": request.get("temperature")},
+        metadata={
+            "requested_model": request.get("model"),
+            "latency_ms": int(response.elapsed.total_seconds() * 1000),
+        },
+    )
+    gen.update(
+        output=choices[0].get("message", {}).get("content") if choices else None,
+        usage_details=obs.usage_details(
+            {
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens"),
+            }
+        ),
+        cost_details=obs.cost_details({"cost_usd": usage.get("cost") or 0.0}),
+    )
+    gen.end()
 
 
 class Jury:
@@ -122,12 +164,18 @@ class Jury:
 
     async def _one(self, judge: str, metric: str, kwargs: dict[str, Any]) -> float | None:
         async with self._sem:
-            try:
-                result = await self._scorers[judge][metric].ascore(**kwargs)
-                return float(result.value) if result.value is not None else None
-            except Exception as exc:  # one failing judge / metric must not abort the run
-                log.warning("judge_metric_failed", judge=judge, metric=metric, error=str(exc)[:200])
-                return None
+            with obs.observe(
+                f"{metric} · {judge}", as_type="evaluator", metadata={"metric": metric, "judge": judge}
+            ) as o:
+                try:
+                    result = await self._scorers[judge][metric].ascore(**kwargs)
+                    value = float(result.value) if result.value is not None else None
+                    o.update(output=value, metadata={"reason": getattr(result, "reason", None)})
+                    return value
+                except Exception as exc:  # one failing judge / metric must not abort the run
+                    log.warning("judge_metric_failed", judge=judge, metric=metric, error=str(exc)[:200])
+                    o.fail(exc, level="WARNING")
+                    return None
 
     async def score(
         self,

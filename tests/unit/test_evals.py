@@ -3,9 +3,10 @@ from __future__ import annotations
 import re
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
-from backend.evals.build_golden import money_re
+from backend.evals.build_golden import in_network, money_re, name_res
 from backend.evals.checks import aggregate, case_checks
 from backend.evals.ragas_jury import Jury
 from backend.evals.run import estimate_cost, flag_disagreement, judged_question, select_cases
@@ -34,6 +35,29 @@ def _result(answer: str, outcome: str = "answered", tools: tuple[str, ...] = ("s
 )
 def test_money_regex(text: str, ok: bool) -> None:
     assert bool(re.search(money_re(2700), text)) is ok
+
+
+def test_in_network_filters_lake_rows_and_names_become_regexes() -> None:
+    lake = pd.DataFrame(
+        [
+            ("1", "Ann Lee, MD", "Lee", "Cardiology", "Choice PPO|Core HMO", "Miami", "FL", True),
+            ("2", "Bo O'Neil, MD", "O'Neil", "Cardiology", "Choice PPO", "Miami", "FL", True),
+            ("3", "Cy Diaz, MD", "Diaz", "Cardiology", "Core HMO", "Miami", "FL", True),
+            ("4", "Di Fox, MD", "Fox", "Cardiology", "Choice PPO", "Miami", "FL", False),
+        ],
+        columns=["npi", "provider_name", "last_name", "specialty", "networks", "city", "state", "accepting"],
+    )
+    rows = in_network(
+        lake,
+        network="Choice PPO",
+        city="Miami",
+        state="FL",
+        exclude_npi="1",
+        specialty="Cardiology",
+        accepting=True,
+    )
+    assert list(rows["npi"]) == ["2"]
+    assert [bool(re.search(p, "See Dr. O'Neil")) for p in name_res(rows)] == [True]
 
 
 def test_answered_case_checks() -> None:

@@ -8,6 +8,7 @@ from arq import func
 from arq.connections import RedisSettings
 
 from backend.agents.tools import sandbox
+from backend.core import observability
 from backend.core.config import settings
 from backend.core.logging import configure_logging, get_logger
 from backend.core.redis import close_redis
@@ -24,6 +25,7 @@ async def startup(ctx: dict[str, Any]) -> None:
 
 async def shutdown(ctx: dict[str, Any]) -> None:
     sandbox.shutdown()
+    observability.shutdown()  # flush pending traces and scores
     await close_redis()
     await dispose()
     log.info("worker_stopped")

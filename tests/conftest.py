@@ -18,13 +18,18 @@ if os.environ.get("HG_LIVE") != "1":
     # Unit and integration tests must never reach a real model.
     os.environ["OPENROUTER_API_KEY"] = ""
     os.environ["EMBEDDING_PROVIDER"] = "hash"
+    # ...nor export traces; `langfuse_spans` installs an in-memory exporter where a test needs one.
+    os.environ["LANGFUSE_ENABLED"] = "false"
 
+import uuid
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+from backend.core import observability
 from backend.llm.client import set_llm
 from backend.llm.fake import FakeLLM
 
@@ -51,3 +56,20 @@ def fake_llm() -> Iterator[Callable[[dict[str, Any]], FakeLLM]]:
 
     yield install
     set_llm(None)
+
+
+@pytest.fixture
+def langfuse_spans() -> Iterator[InMemorySpanExporter]:
+    """Real Langfuse SDK wired to an in-memory exporter (no network); yields the exporter.
+    Call `observability.flush()` before reading `get_finished_spans()`."""
+    exporter = InMemorySpanExporter()
+    client = observability._build_client(
+        public_key=f"pk-lf-test-{uuid.uuid4()}",  # one SDK resource set per test
+        secret_key="sk-lf-test",
+        base_url="http://127.0.0.1:9",
+        span_exporter=exporter,
+    )
+    observability.set_langfuse(client)
+    yield exporter
+    client.shutdown()
+    observability.set_langfuse(None)

@@ -85,6 +85,7 @@ Each record follows the same template: **Status** (with the commit that introduc
 | [0037](0037-packaging-and-deployment.md) | One non-root image, one process per container, production config guards | Reproducible, race-free start-up; insecure configs can't ship |
 | [0038](0038-streamlit-thin-client.md) | Streamlit strictly over the public API | Proportionate UI effort; replaceable without backend changes |
 | [0039](0039-aws-deployment-target.md) | AWS target: ECS on Fargate, Aurora PostgreSQL + pgvector, ElastiCache for Valkey, ALB + WAF (proposed; [full design](../deployment/AWS_DEPLOYMENT.md)) | One-to-one mapping of Compose onto managed services that keep RLS, SSE and the process model intact |
+| [0040](0040-langfuse-llm-observability.md) | Langfuse traces keyed by the app's trace id; generations with OpenRouter cost; masked I/O; scores from verifier, thumbs, jury and RAGAS | Every turn, job and eval case is browsable with prompts, cost and quality side by side |
 
 ## Cross-cutting principles
 

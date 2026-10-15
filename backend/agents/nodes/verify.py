@@ -29,16 +29,19 @@ def _recent(history: str, budget: int = _VERIFY_HISTORY_TOKENS) -> str:
     return history[-budget * 4 :]
 
 
-@traced("verify", "Double-checking the answer")
+@traced("verify", "Double-checking the answer", as_type="evaluator")
 async def verify(state: AgentState) -> dict[str, Any]:
     t0 = time.monotonic()
     user = UserContext.from_dict(state["user"])
+    history = _recent(state.get("recent_turns", ""))
     messages = build_verify_messages(
         question=state.get("standalone_query") or state["message"],
         sources=state.get("sources_text", ""),
         answer=state.get("answer", ""),
         profile=user.profile_text(),
-        history=_recent(state.get("recent_turns", "")),
+        history=history,
+        # On a follow-up the raw message lets the verifier catch a rewrite that changed the subject.
+        message=state["message"] if history or state.get("summary") else "",
     )
     try:
         v = await get_llm().structured(Role.FAST, messages, Verification, name="verify")
@@ -91,7 +94,12 @@ async def verify(state: AgentState) -> dict[str, Any]:
 async def replan(state: AgentState) -> dict[str, Any]:
     v = state.get("verification", {})
     feedback = "; ".join(
-        [p for p in [v.get("missing", "")] if p]
+        (
+            ["the standalone rewrite changed what the user's message refers to"]
+            if v.get("rewrite_mismatch")
+            else []
+        )
+        + [p for p in [v.get("missing", "")] if p]
         + [f"unsupported: {c}" for c in v.get("unsupported_claims", [])]
     )
     replans = state.get("replans", 0) + 1

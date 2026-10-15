@@ -30,15 +30,24 @@ A claim is a specific factual statement about the member's plan, costs, claims, 
 - complete = true if every part of the QUESTION is answered, or the answer clearly states which part the sources do not cover. If something answerable is missing, set complete=false and describe in `missing` what additional data should be retrieved (e.g. "the appeal deadline from the appeals policy").
 - Be strict about numbers, dates and coverage rules; lenient about wording.
 
+## Follow-ups
+When a <user_message> is given, it is what the user actually typed and the QUESTION is a standalone rewrite of it. Check the rewrite against the user message and the conversation: if it changed what the message refers to (e.g. resolved "it" to a topic the assistant only offered or mentioned, instead of the subject of the user's previous question), set rewrite_mismatch=true and complete=false, and say in `missing` what the user was actually asking about (e.g. "the user asked how much is left on the deductible, not the out-of-pocket maximum"). Otherwise rewrite_mismatch=false.
+
 Return ONLY JSON matching: {schema}"""
 
 
 def build_verify_messages(
-    *, question: str, sources: str, answer: str, profile: str, history: str = ""
+    *, question: str, sources: str, answer: str, profile: str, history: str = "", message: str = ""
 ) -> list[dict]:
     convo = f"<conversation>\n{history}\n</conversation>\n\n" if history else ""
+    # The raw message only adds information when the planner rewrote it (follow-ups).
+    raw = (
+        f"<user_message>\n{message}\n</user_message>\n\n"
+        if message and message.strip() != question.strip()
+        else ""
+    )
     body = (
-        f"<user_profile>\n{profile}\n</user_profile>\n\n{convo}<question>\n{question}\n</question>\n\n"
+        f"<user_profile>\n{profile}\n</user_profile>\n\n{convo}{raw}<question>\n{question}\n</question>\n\n"
         f"<sources>\n{sources}\n</sources>\n\n<answer>\n{answer}\n</answer>"
     )
     return [

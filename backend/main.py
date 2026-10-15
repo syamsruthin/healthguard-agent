@@ -22,6 +22,7 @@ from backend.agents.tools import sandbox
 from backend.api.middleware import BodySizeLimitMiddleware, RequestContextMiddleware
 from backend.api.routers import admin, auth, conversations, feedback, health, me
 from backend.cache.semantic import get_semantic_cache
+from backend.core import observability
 from backend.core.config import settings
 from backend.core.errors import install_error_handlers
 from backend.core.logging import configure_logging, get_logger
@@ -52,6 +53,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await drain_background()
         warm.cancel()
         sandbox.shutdown()
+        observability.shutdown()  # flush pending traces and scores
         set_enqueuer(None)
         await enqueuer.close()
         set_graph(None)

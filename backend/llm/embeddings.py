@@ -22,6 +22,7 @@ from typing import Protocol
 import numpy as np
 from openai import AsyncOpenAI
 
+from backend.core import observability as obs
 from backend.core.config import settings
 from backend.core.logging import get_logger
 from backend.core.redis import get_redis
@@ -74,8 +75,18 @@ class OpenRouterEmbedder:
         bs = settings.embedding_batch_size
         for i in range(0, len(texts), bs):
             batch = [t[:8000] for t in texts[i : i + bs]]
-            resp = await self._client.embeddings.create(model=self.model, input=batch)
-            usage = parse_usage(getattr(resp, "usage", None))
+            # Only inside a trace: corpus ingestion would otherwise open one trace per batch.
+            with obs.observe(
+                "embed",
+                as_type="embedding",
+                require_parent=True,
+                input=batch if len(batch) > 1 else batch[0],
+                model=self.model,
+                metadata={"texts": len(batch), "dim": self.dim},
+            ) as span:
+                resp = await self._client.embeddings.create(model=self.model, input=batch)
+                usage = parse_usage(getattr(resp, "usage", None))
+                span.update(usage_details=obs.usage_details(usage), cost_details=obs.cost_details(usage))
             record(
                 LLMCallRecord(
                     role="embed",
@@ -145,6 +156,7 @@ async def embed_query(text: str) -> list[float]:
     try:
         cached = await get_redis().get(key)
         if cached:
+            obs.event("embedding.cache_hit", input=text, model=emb.model)
             return _unpack(cached)
     except Exception as exc:
         log.debug("embedding_cache_unavailable", error=str(exc))

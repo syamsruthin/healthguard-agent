@@ -18,6 +18,7 @@ from backend.agents.state import AgentState
 from backend.agents.tools.base import UserContext
 from backend.agents.trace import append, emit, step, traced
 from backend.cache.semantic import CacheHit, cache_scope, get_semantic_cache, lookup_key, lookup_scopes
+from backend.core import observability as obs
 from backend.core.config import settings
 from backend.core.logging import get_logger
 from backend.core.telemetry import CACHE_EVENTS
@@ -26,14 +27,35 @@ log = get_logger(__name__)
 
 
 async def _lookup(query: str, scopes: list[str], data_version: int) -> CacheHit | None:
-    try:
-        hit = await get_semantic_cache().lookup(query, scopes=scopes, data_version=data_version)
-    except Exception as exc:  # the cache must never break a turn
-        CACHE_EVENTS.labels(layer="semantic", outcome="error").inc()
-        log.warning("semantic_cache_lookup_failed", error=str(exc)[:200])
-        return None
-    CACHE_EVENTS.labels(layer="semantic", outcome="hit" if hit else "miss").inc()
-    return hit
+    with obs.observe(
+        "semantic_cache.lookup",
+        as_type="retriever",
+        input=query,
+        metadata={
+            "scopes": scopes,
+            "data_version": data_version,
+            "distance_threshold": settings.semantic_cache_distance_threshold,
+        },
+    ) as o:
+        try:
+            hit = await get_semantic_cache().lookup(query, scopes=scopes, data_version=data_version)
+        except Exception as exc:  # the cache must never break a turn
+            CACHE_EVENTS.labels(layer="semantic", outcome="error").inc()
+            log.warning("semantic_cache_lookup_failed", error=str(exc)[:200])
+            o.fail(exc, level="WARNING")
+            return None
+        CACHE_EVENTS.labels(layer="semantic", outcome="hit" if hit else "miss").inc()
+        o.update(
+            output={"hit": False}
+            if hit is None
+            else {
+                "hit": True,
+                "scope": hit.scope,
+                "distance": round(hit.distance, 4),
+                "cached_query": hit.payload.get("standalone_query"),
+            }
+        )
+        return hit
 
 
 def _served(state: AgentState, node: str, hit: CacheHit, query: str, ms: float, scope: str) -> dict[str, Any]:
@@ -67,12 +89,15 @@ def _served(state: AgentState, node: str, hit: CacheHit, query: str, ms: float, 
     return update
 
 
-@traced("cache_first", "Checking recent answers")
+@traced("cache_first", "Checking recent answers", as_type="retriever")
 async def cache_first(state: AgentState) -> dict[str, Any]:
     t0 = time.monotonic()
     user = UserContext.from_dict(state["user"])
     query = lookup_key(dict(state))
-    if prefilter(state["message"], user):  # `understand` blocks it without a model call
+    with obs.observe("guardrail.prefilter", as_type="guardrail", input=state["message"]) as g:
+        reason = prefilter(state["message"], user)
+        g.update(output={"blocked": bool(reason), "reason": reason})
+    if reason:  # `understand` blocks it without a model call
         return {"trace": append(state, step("cache_first", input=query, output="skipped: prefilter"))}
     scopes = lookup_scopes(user, needs_member_data=False)  # own scope first, then public
     hit = await _lookup(query, scopes, state.get("data_version", 0))
@@ -88,7 +113,7 @@ async def cache_first(state: AgentState) -> dict[str, Any]:
     return _served(state, "cache_first", hit, query, ms, scope=hit.scope)
 
 
-@traced("cache_lookup", "Checking recent answers")
+@traced("cache_lookup", "Checking recent answers", as_type="retriever")
 async def cache_lookup(state: AgentState) -> dict[str, Any]:
     t0 = time.monotonic()
     user = UserContext.from_dict(state["user"])
