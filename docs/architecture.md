@@ -174,7 +174,7 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    DB[(Seeded DB + CSV lake + corpus)] --> B["hg-build-golden<br/>59 cases, numeric ground truth"]
+    DB[(Seeded DB + CSV lake + corpus)] --> B["hg-build-golden<br/>71 cases, numeric ground truth"]
     B --> R["hg-eval runner<br/>each case as its persona<br/>through chat_service"]
     R --> C["Deterministic checks<br/>answer rate · refusals · routing<br/>isolation · required content"]
     R --> J["RAGAS jury<br/>GPT · Gemini · Claude judges<br/>mean + spread per metric"]

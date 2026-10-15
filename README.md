@@ -544,7 +544,7 @@ What the suites cover:
 
 ## Evaluation
 
-The golden set (`backend/evals/datasets/golden.jsonl`, 59 cases) is built by `hg-build-golden` from the seeded data. Numeric ground truth comes from SQL and pandas queries; policy references quote the corpus. It covers ten categories:
+The golden set (`backend/evals/datasets/golden.jsonl`, 71 cases) is built by `hg-build-golden` from the seeded data. Numeric ground truth comes from SQL and pandas queries; policy references quote the corpus. It covers twelve categories:
 
 | Category | Cases |
 |---|---|
@@ -552,8 +552,10 @@ The golden set (`backend/evals/datasets/golden.jsonl`, 59 cases) is built by `hg
 | Provider search | 6 |
 | Policy RAG | 12 |
 | Member-scoped (per persona) | 14 |
-| Multi-hop | 4 |
-| Memory follow-ups | 2 |
+| Multi-hop (records + policy) | 4 |
+| Multi-intent (provider lake + records/policy, incl. three-source) | 5 |
+| Dependent hops (a later step needs an earlier step's output) | 4 |
+| Memory follow-ups | 5 |
 | Out of scope | 3 |
 | Prompt injection | 3 |
 | Cross-member probes | 3 |
@@ -572,6 +574,7 @@ uv run hg-eval --limit 10 --judges 1            # cheapest real run (~$0.21)
 uv run hg-eval --no-ragas                       # deterministic checks only
 uv run hg-eval --rescore <RUN_ID>               # re-judge stored answers without re-running the agent
 uv run hg-eval --metrics all --categories policy_rag,multi_hop
+uv run hg-eval --dry-run --judges 3 --categories multi_intent,dependent_hop,memory_followup
 ```
 
 Judge responses are cached on disk (`backend/evals/.cache/`, one cache per judge), so re-scoring unchanged answers costs nothing. The `eval.yml` workflow runs **only on demand** (10 cases by default) and never on a schedule.

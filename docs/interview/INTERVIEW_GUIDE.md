@@ -86,7 +86,7 @@ How to present, defend and extend HealthGuard in an AI Architect interview. The 
 | Limits | 4 plan steps · 2 tool retries · 1 rewrite · 1 replan · 90 s per step · **150 s per turn** · 5 s SQL · 10 s sandbox · 200 SQL rows | config |
 | Eval baseline (10 cases, 3 judges) | answer rate, refusal, routing, isolation **1.0**; recall **1.0**; content 0.86; faithfulness **0.80** (gate 0.85); relevancy **0.68** (gate 0.80) | rescore `50e47e0d` |
 | Data | 40 plans · 1,504 members · 14.3k claims · 9.6k pharmacy claims · 5,016 providers · 60 docs → ~434 chunks | seed 42 |
-| Golden set | **59 cases**, 10 categories | `golden.jsonl` |
+| Golden set | **71 cases**, 12 categories | `golden.jsonl` |
 | Tests | ~**250** automated, coverage gate **78 %** | CI |
 
 ---
@@ -175,7 +175,7 @@ For each topic: what to say, then the follow-ups you should expect, with answers
 
 ### 4.7 Evaluation
 
-**Say:** "A 59-case golden set built from the database, so references are correct by construction; each case runs as its persona through the real chat pipeline; deterministic checks for binary properties, a three-family RAGAS jury for quality, and a CI gate." ([ADR-0034](../adr/0034-evaluation-strategy.md))
+**Say:** "A 71-case golden set built from the database, so references are correct by construction; each case runs as its persona through the real chat pipeline; deterministic checks for binary properties, a three-family RAGAS jury for quality, and a CI gate." ([ADR-0034](../adr/0034-evaluation-strategy.md))
 
 | Follow-up | Answer |
 |---|---|
