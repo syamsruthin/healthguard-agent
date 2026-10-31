@@ -8,28 +8,71 @@ The reasoning behind each design choice (context, alternatives, trade-offs) is i
 
 ## 1. System view
 
+Six containers (`ui`, `api`, `worker`, `migrate`, `postgres`, `redis`) plus external services. The LangGraph agent, its tools and the LLM layer all run inside the API process. Solid arrows are the request path; dotted arrows are telemetry.
+
 ```mermaid
 flowchart LR
-    U([Member / admin browser]) --> UI["Streamlit UI<br/>login · chat · coverage · memory · admin"]
-    UI -- "REST + SSE (JWT)" --> API["FastAPI /api/v1<br/>auth · rate limits · chat · admin"]
-    API --> G["LangGraph agent<br/>cache-first → understand → execute → synthesize → verify"]
-    API -- "follow-up jobs" --> Q[(Redis 8<br/>arq queue)]
-    Q --> W["arq worker<br/>titles · summaries · memories · online eval · offline eval"]
-    G --> LLM["LLM layer<br/>per-role models · prompt caching · usage"]
-    LLM --> OR([OpenRouter])
-    G --> SQL["SQL tool<br/>guard · read-only role · RLS"]
-    G --> PD["Provider tool<br/>pandas sandbox"]
-    G --> RAG["Policy search<br/>pgvector + full text + RRF"]
-    SQL --> PG[("Postgres 17 + pgvector<br/>app · insurance · rag")]
-    RAG --> PG
-    PD --> CSV[("CSV lake<br/>providers · facilities · pharmacies")]
-    API --> PG
-    W --> PG
-    G <--> SC[("Redis 8<br/>semantic answer cache")]
-    LLM <--> EC[("Redis<br/>exact LLM + embedding cache")]
-    API -. "/metrics" .-> PROM([Prometheus])
-    API -. "OTLP spans" .-> J([Jaeger])
+    USER(["Member / admin<br/>browser"]) --> UI
+
+    subgraph C1["ui :8501"]
+        UI["Streamlit UI<br/>chat · coverage · memory<br/>admin dashboards"]
+    end
+
+    subgraph C2["api :8000 · FastAPI process"]
+        direction TB
+        API["Routers + middleware<br/>JWT · rate limits · /metrics"]
+        TURN["Turn task (chat_service)<br/>turn lock · deadline<br/>memory context · SSE · persist"]
+        AGENT["LangGraph agent<br/>cache_first → understand<br/>→ execute → synthesize<br/>→ verify → finalize<br/>(rewrite + replan loops)"]
+        subgraph TOOLS["Tools"]
+            direction TB
+            SQLT["sql<br/>sqlglot guard · RLS"]
+            PDT["providers<br/>pandas sandbox"]
+            RAGT["policy_search<br/>pgvector + FTS · RRF"]
+        end
+        LLM["LLM layer<br/>roles FAST · CODE · SYNTH<br/>exact cache · usage"]
+        API --> TURN --> AGENT --> TOOLS
+        AGENT --> LLM
+        TOOLS -- "codegen" --> LLM
+    end
+
+    subgraph C3["worker · arq"]
+        WK["titles · summaries<br/>memories · online / offline eval"]
+    end
+
+    subgraph STORES["Data stores"]
+        direction TB
+        PG[("Postgres 17 + pgvector<br/>app · insurance (RLS) · rag<br/>graph checkpoints")]
+        RD[("Redis 8<br/>semantic + LLM + embedding caches<br/>locks · rate limits · arq queue")]
+        CSV[("CSV lake<br/>providers · facilities<br/>pharmacies")]
+    end
+
+    subgraph EXT["External"]
+        direction TB
+        OR(["OpenRouter<br/>chat + embeddings"])
+        LF(["Langfuse"])
+        OBS(["Prometheus · Jaeger"])
+    end
+
+    UI -- "REST + SSE · JWT" --> API
+    SQLT --> PG
+    RAGT --> PG
+    PDT --> CSV
+    TURN --> PG
+    TURN -- "jobs" --> RD
+    AGENT <-- "semantic cache" --> RD
+    LLM --> OR
+    LLM <--> RD
+    RD --> WK
+    WK --> PG
+    WK --> OR
+    C2 -.-> LF
+    C2 -.-> OBS
 ```
+
+- **Turn task** (`backend/services/chat_service.py`): takes the per-conversation Redis lock, loads the memory context, runs the graph under the turn deadline, persists the result and enqueues follow-up jobs.
+- **Tools:** `sql` and `providers` generate code with the CODE model and self-correct on errors; `policy_search` is hybrid retrieval. A dependent step receives its prerequisites' output.
+- **LLM layer:** maps roles to OpenRouter models with fallbacks, checks the exact LLM cache in Redis, marks stable prefixes for provider prompt caching, and records tokens and cost per call.
+- **Redis** holds every piece of fast shared state: the semantic answer cache, the exact LLM and embedding caches, turn locks, rate limits and the arq queue.
 
 ## 2. Agent graph
 
@@ -66,39 +109,147 @@ flowchart TD
 
 ## 3. A streamed chat turn
 
+A member asks a question that needs two independent tool steps and one dependent step. Events the agent emits go through the turn task's queue to the SSE response; the diagram draws them straight to the UI for brevity. The login/refresh flow, admin endpoints and the offline eval runner are left out.
+
 ```mermaid
 sequenceDiagram
     autonumber
-    participant UI as Streamlit
+    actor M as Member
+    participant UI as Streamlit UI
     participant API as FastAPI
-    participant T as Turn task
-    participant G as LangGraph
-    participant OR as OpenRouter
+    participant RD as Redis
     participant DB as Postgres
-    UI->>API: POST /conversations/{id}/messages/stream (JWT)
-    API->>API: rate limit · ownership · Redis turn lock
-    API->>DB: insert user message
-    API-->>UI: 200 text/event-stream
-    API->>T: start background task (queue → SSE)
-    T-->>UI: meta
-    T->>DB: user context · memory context · data version
-    T->>G: run graph (bounded by TURN_TIMEOUT_SECONDS)
-    G->>G: cache_first (opening question, a hit ends the turn here)
-    G->>OR: understand (prompt-cached prefix)
-    G-->>UI: status, plan
-    par independent steps
-        G->>DB: generated SQL as hg_agent_ro under RLS
-    and
-        G->>DB: hybrid policy search
+    participant T as Turn task
+    participant G as LangGraph agent
+    participant TL as Tools
+    participant L as LLM layer
+    participant OR as OpenRouter
+    participant W as arq worker
+
+    rect rgba(31,122,90,0.08)
+    Note over M,DB: Admission
+    M->>UI: types a question
+    UI->>API: POST /conversations/{id}/messages/stream (Bearer JWT)
+    API->>API: verify JWT, input checks
+    API->>RD: per-user rate limit + daily turn cap
+    API->>DB: load conversation (not owner → 404)
+    API->>RD: SET hg:turn:{id} NX EX (turn lock)
+    alt lock already held
+        API-->>UI: 409 turn already running
     end
-    G-->>UI: tool (running / ok)
-    G->>OR: synthesize (stream)
+    API->>DB: insert user message, commit
+    API->>T: spawn background task (event queue)
+    API-->>UI: 200 text/event-stream
+    end
+
+    rect rgba(31,122,90,0.04)
+    Note over T,DB: Context
+    T-->>UI: meta
+    T->>DB: user + member profile + dependents
+    T->>DB: recent turns, rolling summary, long-term memories, data version
+    T->>G: run_graph(initial_state), bounded by TURN_TIMEOUT_SECONDS
+    end
+
+    rect rgba(31,122,90,0.08)
+    Note over G,OR: Cache-first (opening question only)
+    G->>L: embed normalised question
+    L->>RD: embedding cache (miss → OpenRouter)
+    G->>RD: semantic cache search (member scope, then public)
+    alt verified answer cached
+        RD-->>G: cached answer + citations
+        G-->>T: finalize (no chat-model call)
+    end
+    end
+
+    rect rgba(31,122,90,0.04)
+    Note over G,OR: Understand
+    G->>G: prefilter (injection patterns, other member IDs)
+    G->>L: FAST structured call (scope, safety, rewrite, plan)
+    L->>RD: exact LLM cache lookup
+    L->>OR: chat completion with prompt-cached prefix
+    OR-->>L: Understanding JSON
+    L-->>G: validated Understanding
+    G->>G: sanitize_plan → plan_levels (DAG)
+    G-->>UI: status, plan
+    opt follow-up question
+        G->>RD: cache_lookup on the standalone rewrite
+    end
+    end
+
+    rect rgba(31,122,90,0.08)
+    Note over G,OR: Execute, level 0 (independent steps in parallel)
+    par s1 sql
+        G->>TL: run_sql_tool(task)
+        loop until valid, at most MAX_TOOL_RETRIES
+            TL->>L: CODE: generate SQL (with last error)
+            L->>OR: completion
+            TL->>TL: sqlglot guard (one SELECT, allowed tables)
+            TL->>DB: SET LOCAL app.role, app.member_id, timeout → SELECT as hg_agent_ro under RLS
+        end
+        TL-->>G: rows formatted as S sources
+    and s2 policy_search
+        G->>TL: run_policy_search(task)
+        TL->>L: embed query
+        TL->>DB: pgvector cosine + full-text ts_rank
+        TL->>TL: reciprocal rank fusion
+        TL-->>G: chunks formatted as D sources
+    end
+    G-->>UI: tool running / ok per step
+    end
+
+    rect rgba(31,122,90,0.04)
+    Note over G,OR: Execute, level 1 (s3 depends_on s1)
+    G->>G: prior_context(s1 output)
+    G->>TL: run_dataframe_tool(task, prior)
+    TL->>L: CODE: generate pandas
+    L->>OR: completion
+    TL->>TL: AST allow-list → run in process-pool sandbox over CSV lake
+    TL-->>G: providers table
+    G-->>UI: tool ok
+    end
+
+    rect rgba(31,122,90,0.08)
+    Note over G,OR: Synthesize and verify
+    G->>L: SYNTH stream (question + tagged sources)
+    L->>OR: streaming completion
+    OR-->>L: tokens
     G-->>UI: token … token, citations
-    G->>OR: verify
-    T->>DB: assistant message · trace · llm_calls
-    T-->>UI: final (answer, plan, steps, citations, usage, admin-only trace)
-    T->>T: semantic-cache store · enqueue follow-ups that have work · release own lock
+    G->>L: FAST verify (grounded, complete)
+    L->>OR: completion
+    alt ungrounded, first time
+        G->>L: rewrite without the flagged claims
+    else ungrounded again
+        G-->>UI: answer_replaced (insufficient-context fallback)
+    else incomplete and a replan is left
+        G->>G: replan → understand → execute r1- steps → synthesize
+    else grounded and complete
+        G->>G: finalize
+    end
+    G-->>T: final state
+    end
+
+    rect rgba(31,122,90,0.04)
+    Note over T,W: Persist and follow up
+    T->>DB: assistant message + trace + llm_calls (one transaction)
+    T-->>UI: final (answer, plan, steps, citations, usage)
+    T->>RD: store in semantic cache (verified turns only, scoped)
+    T->>RD: enqueue jobs that have work
+    T->>RD: release turn lock (compare-and-delete)
+    Note over T: Langfuse trace flushed, Prometheus counters updated
+    RD-->>W: title / summarize / extract memories / online eval
+    W->>L: FAST or JUDGE calls
+    L->>OR: completion
+    W->>DB: titles, summaries, memories, eval scores, llm_calls
+    end
 ```
+
+1. **Admission** is synchronous in the request: auth, rate limits, ownership and the turn lock. The user message is committed before any model call.
+2. **Context.** The turn task loads the member profile and a token-budgeted memory context, then runs the graph under `TURN_TIMEOUT_SECONDS`. On timeout the graph is cancelled and the `timeout` fallback is saved.
+3. **Cache-first.** Only an opening question is self-contained enough to look up before planning. A hit replays a verified answer with no chat-model call.
+4. **Understand.** The deterministic prefilter runs first; one FAST call then classifies, rewrites and plans. The plan is untrusted and is repaired into a DAG.
+5. **Execute.** Steps in the same dependency level run concurrently inside the one node. A dependent step gets up to 3,000 characters of each prerequisite's output; if a prerequisite failed, it is skipped.
+6. **Synthesize and verify.** The answer streams token by token, then the FAST verifier checks it: one rewrite for ungrounded claims, one replan for missing parts.
+7. **Persist and follow up.** Message, trace and per-call cost are saved in one transaction. Background jobs are queued only when they have work.
 
 A client disconnect never cancels the turn task, so the answer is always persisted.
 
